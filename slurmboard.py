@@ -31,6 +31,7 @@ import getpass
 import socket
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import unquote
 
 log = logging.getLogger("slurmboard")
 
@@ -431,10 +432,33 @@ _JOB_RE = {
 }
 
 
+def normalize_job_id(jobid):
+    """Return an scontrol-compatible ID for regular and array jobs."""
+    value = unquote(str(jobid)).strip()
+    if re.fullmatch(r"\d+(?:_\d+)?", value):
+        return value
+
+    match = re.fullmatch(r"(\d+)_\[(\d+)\]", value)
+    if match:
+        return f"{match.group(1)}_{match.group(2)}"
+
+    # squeue compresses pending array ranges (for example 123_[1-20%4]).
+    # scontrol cannot show that expression directly, so query its parent job.
+    match = re.fullmatch(
+        r"(\d+)_\[(\d+(?:-\d+(?::\d+)?)?(?:,\d+(?:-\d+(?::\d+)?)?)*(?:%\d+)?)\]",
+        value,
+    )
+    if match:
+        return match.group(1)
+
+    raise ValueError(f"Invalid job ID: {jobid!r}")
+
+
 def collect_job_detail(jobid):
-    if not re.match(r"^\d+(_\d+)?$", str(jobid)):
+    query_jobid = normalize_job_id(jobid)
+    if not re.match(r"^\d+(_\d+)?$", query_jobid):
         raise ValueError(f"Invalid job ID: {jobid!r}")
-    text = _run(["scontrol", "show", "job", str(jobid)])
+    text = _run(["scontrol", "show", "job", query_jobid])
 
     info = {}
     for key, rx in _JOB_RE.items():
