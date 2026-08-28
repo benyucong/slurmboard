@@ -57,10 +57,10 @@ When no port is specified, slurmboard first tries port 9001. If it is occupied, 
 ```text
 On your local machine, run this SSH forwarding command:
 
-  ssh -N -L 9001:127.0.0.1:9001 user@login.example.org
+  ssh -N -L 9001:127.0.0.1:9001 <your-ssh-host>
 ```
 
-Run the printed command in a terminal on your local computer. If you normally connect through an alias from `~/.ssh/config`, replace `user@login.example.org` with that alias:
+Replace `<your-ssh-host>` with the host or SSH config alias you normally use, then run the command in a terminal on your local computer. For example:
 
 ```bash
 ssh -N -L 9001:127.0.0.1:9001 my-cluster

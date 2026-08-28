@@ -28,7 +28,6 @@ import random
 import re
 import subprocess
 import getpass
-import socket
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import unquote
@@ -1813,14 +1812,13 @@ def create_http_server(host, requested_port=None, max_attempts=100):
 
 
 def print_forwarding_instructions(port):
-    login_target = f"{getpass.getuser()}@{socket.getfqdn()}"
-    command = f"ssh -N -L {port}:127.0.0.1:{port} {login_target}"
+    command = f"ssh -N -L {port}:127.0.0.1:{port} <your-ssh-host>"
     print("\nOn your local machine, run this SSH forwarding command:", file=sys.stderr)
     print(f"\n  {command}\n", file=sys.stderr)
     print("Then open:", file=sys.stderr)
     print(f"\n  http://127.0.0.1:{port}\n", file=sys.stderr)
-    print("If you normally connect with an SSH config alias, replace "
-          f"'{login_target}' with that alias.\n", file=sys.stderr, flush=True)
+    print("Replace <your-ssh-host> with the host or SSH config alias you normally use.\n",
+          file=sys.stderr, flush=True)
 
 
 def main():
