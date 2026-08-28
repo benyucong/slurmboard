@@ -794,6 +794,46 @@ PAGE_TEMPLATE = """<!DOCTYPE html>
              font-size: 10px; padding: 2px 7px; border-radius: 4px; cursor: pointer; }
   .uj-sort:hover { color: var(--text); }
   .uj-sort.active { border-color: var(--accent); color: var(--accent); }
+
+  /* in-dashboard job detail dialog */
+  .job-modal { position: fixed; inset: 0; z-index: 1000; display: none;
+               align-items: center; justify-content: center; padding: 28px;
+               background: rgba(0,0,0,.55); backdrop-filter: blur(2px); }
+  .job-modal.open { display: flex; }
+  .job-dialog { width: min(760px, 100%); max-height: min(820px, calc(100vh - 56px));
+                overflow: auto; background: var(--bg); border: 1px solid var(--border);
+                border-radius: 14px; box-shadow: 0 24px 80px rgba(0,0,0,.45); }
+  .job-dialog-head { position: sticky; top: 0; z-index: 1; display: flex;
+                     align-items: center; gap: 10px; padding: 16px 18px;
+                     background: var(--bg); border-bottom: 1px solid var(--border); }
+  .job-dialog-title { font-size: 18px; font-weight: 700; }
+  .job-dialog-close { margin-left: auto; width: 30px; height: 30px; border-radius: 50%;
+                      border: 1px solid var(--border); background: var(--panel);
+                      color: var(--text); cursor: pointer; font-size: 18px; line-height: 1; }
+  .job-dialog-body { padding: 18px; }
+  .job-dialog-name { color: var(--muted); margin: -8px 0 14px; }
+  .job-dialog-error { color: var(--bad); padding: 22px 0; text-align: center; }
+  .job-dialog-title .running, .job-dialog-title .completing {
+    background: rgba(62,201,124,.15); color: var(--good);
+  }
+  .job-dialog-title .pending { background: rgba(240,169,63,.15); color: var(--warn); }
+  .job-dialog-title .completed { background: rgba(79,140,255,.15); color: var(--accent); }
+  .job-dialog-title .failed, .job-dialog-title .cancelled,
+  .job-dialog-title .timeout, .job-dialog-title .node_fail {
+    background: rgba(239,91,91,.15); color: var(--bad);
+  }
+  .job-grid { display: grid; grid-template-columns: repeat(auto-fit,minmax(280px,1fr)); gap: 12px; }
+  .job-card { background: var(--panel); border: 1px solid var(--border);
+              border-radius: 10px; padding: 14px; }
+  .job-card.full { grid-column: 1/-1; }
+  .job-card-title { color: var(--muted); font-size: 11px; text-transform: uppercase;
+                    letter-spacing: .05em; margin-bottom: 8px; font-weight: 600; }
+  .job-card table { border: 0; border-radius: 0; font-size: 13px; }
+  .job-card td { padding: 5px 0; white-space: normal; vertical-align: top; }
+  .job-card td:first-child { width: 105px; color: var(--muted); padding-right: 12px; white-space: nowrap; }
+  .job-reason { color: var(--warn); background: rgba(240,169,63,.1);
+                border: 1px solid rgba(240,169,63,.3); border-radius: 6px;
+                padding: 8px 12px; margin-bottom: 14px; }
 </style>
 </head>
 <body>
@@ -873,6 +913,16 @@ PAGE_TEMPLATE = """<!DOCTYPE html>
   </div>
 </main>
 <footer>slurmboard &middot; data sourced live from <code>sinfo</code> / <code>scontrol</code> on this login node &middot; reload to refresh</footer>
+
+<div class="job-modal" id="job-modal" role="dialog" aria-modal="true" aria-labelledby="job-dialog-title">
+  <div class="job-dialog">
+    <div class="job-dialog-head">
+      <div class="job-dialog-title" id="job-dialog-title">Job details</div>
+      <button class="job-dialog-close" id="job-dialog-close" aria-label="Close job details">×</button>
+    </div>
+    <div class="job-dialog-body" id="job-dialog-body"></div>
+  </div>
+</div>
 
 <script>
 let SNAPSHOT = __SNAPSHOT_JSON__;
@@ -983,6 +1033,74 @@ function statePill(state) {
 function minibar(pct, cls='') {
   return `<span class="minibar ${cls}"><span style="width:${pct}%"></span></span>`;
 }
+
+// ── job detail modal ───────────────────────────────────────────────────────
+const jobModal = document.getElementById('job-modal');
+const jobDialogTitle = document.getElementById('job-dialog-title');
+const jobDialogBody = document.getElementById('job-dialog-body');
+
+function escapeHtml(value) {
+  return String(value == null ? '' : value).replace(/[&<>"']/g, ch => ({
+    '&':'&amp;', '<':'&lt;', '>':'&gt;', '"':'&quot;', "'":'&#39;'
+  })[ch]);
+}
+
+function jobValue(value) {
+  return value == null || value === '' || value === '(null)' || value === 'N/A'
+    ? '—' : escapeHtml(value);
+}
+
+function jobCard(title, rows, full=false) {
+  const body = rows.filter(([, value]) => value != null && value !== '' && value !== '(null)' && value !== 'N/A')
+    .map(([label, value, code]) => `<tr><td>${escapeHtml(label)}</td><td>${code ? `<code>${jobValue(value)}</code>` : jobValue(value)}</td></tr>`)
+    .join('');
+  if (!body) return '';
+  return `<section class="job-card${full ? ' full' : ''}"><div class="job-card-title">${escapeHtml(title)}</div><table><tbody>${body}</tbody></table></section>`;
+}
+
+function closeJobModal() {
+  jobModal.classList.remove('open');
+}
+
+async function openJobModal(jobID) {
+  jobDialogTitle.textContent = `Job ${jobID}`;
+  jobDialogBody.innerHTML = '<div class="muted" style="padding:22px 0;text-align:center">Loading…</div>';
+  jobModal.classList.add('open');
+  try {
+    const response = await fetch(`/api/job/${encodeURIComponent(jobID)}`);
+    const payload = await response.json();
+    if (!response.ok || payload.error) throw new Error(payload.error || `HTTP ${response.status}`);
+    const info = payload.job;
+    const state = (info.state || 'UNKNOWN').toUpperCase();
+    const stateClass = ['running','completing','pending','completed','failed','cancelled','timeout','node_fail']
+      .includes(state.toLowerCase()) ? state.toLowerCase() : 'other';
+    const gpu = info.gpu_count ? `${info.gpu_count}× ${info.gpu_type || 'gpu'}` : null;
+    const reason = info.reason && info.reason !== 'None' && info.reason !== '(null)'
+      ? `<div class="job-reason">Reason: ${escapeHtml(info.reason)}</div>` : '';
+    jobDialogTitle.innerHTML = `Job ${escapeHtml(jobID)} <span class="pill ${stateClass}">${escapeHtml(state)}</span>`;
+    jobDialogBody.innerHTML = `
+      <div class="job-dialog-name">${jobValue(info.job_name)}</div>${reason}
+      <div class="job-grid">
+        ${jobCard('Identity', [['User',info.user],['Account',info.account],['QOS',info.qos],['Partition',info.partition],['Priority',info.priority],['Exit code',info.exit_code]])}
+        ${jobCard('Resources', [['Nodes',info.num_nodes],['CPUs',info.num_cpus],['Tasks',info.num_tasks],['CPUs / task',info.cpus_task],['GPUs',gpu],['Memory',info.mem_cpu || info.mem_node],['TRES',info.tres]])}
+        ${jobCard('Timing', [['Submit',info.submit_time],['Start',info.start_time],['End',info.end_time],['Run time',info.runtime],['Time limit',info.timelimit]])}
+        ${jobCard('Nodes', [['Node list',info.nodelist],['Batch host',info.batch_host]])}
+        ${jobCard('Paths', [['Work dir',info.workdir,true],['Command',info.command,true],['Stdout',info.stdout,true],['Stderr',info.stderr,true]], true)}
+      </div>`;
+  } catch (error) {
+    jobDialogBody.innerHTML = `<div class="job-dialog-error">${escapeHtml(error.message)}</div>`;
+  }
+}
+
+document.addEventListener('click', event => {
+  const link = event.target.closest('a.uj-id');
+  if (!link || event.button !== 0 || event.metaKey || event.ctrlKey || event.shiftKey || event.altKey) return;
+  event.preventDefault();
+  openJobModal(link.textContent.trim());
+});
+document.getElementById('job-dialog-close').addEventListener('click', closeJobModal);
+jobModal.addEventListener('click', event => { if (event.target === jobModal) closeJobModal(); });
+document.addEventListener('keydown', event => { if (event.key === 'Escape' && jobModal.classList.contains('open')) closeJobModal(); });
 
 // ── multi-column sort ───────────────────────────────────────────────────────
 // Array of {key, dir} objects; first entry = primary sort.
@@ -1720,6 +1838,24 @@ class Handler(BaseHTTPRequestHandler):
             self.send_header("Content-Type",   "text/html; charset=utf-8")
             self.send_header("Content-Length", str(len(body)))
             self.send_header("Cache-Control",  "no-store")
+            self.end_headers()
+            self.wfile.write(body)
+        elif self.path.startswith("/api/job/"):
+            jobid = self.path[len("/api/job/"):].strip("/").split("?")[0]
+            try:
+                body = json.dumps({"job": collect_job_detail(jobid)}).encode("utf-8")
+                status = 200
+            except ValueError as exc:
+                body = json.dumps({"error": str(exc)}).encode("utf-8")
+                status = 400
+            except Exception as exc:
+                log.error("collect_job_detail failed for %r: %s", jobid, exc, exc_info=True)
+                body = json.dumps({"error": str(exc)}).encode("utf-8")
+                status = 500
+            self.send_response(status)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Cache-Control", "no-store")
             self.end_headers()
             self.wfile.write(body)
         elif self.path.startswith("/job/"):
