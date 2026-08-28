@@ -453,16 +453,17 @@ def normalize_job_id(jobid):
     raise ValueError(f"Invalid job ID: {jobid!r}")
 
 
-def collect_job_detail(jobid):
-    query_jobid = normalize_job_id(jobid)
-    if not re.match(r"^\d+(_\d+)?$", query_jobid):
-        raise ValueError(f"Invalid job ID: {jobid!r}")
-    text = _run(["scontrol", "show", "job", query_jobid])
-
+def _parse_scontrol_job_detail(text):
     info = {}
     for key, rx in _JOB_RE.items():
         m = rx.search(text)
         info[key] = m.group(1).strip() if m else None
+
+    return _add_job_gpu_detail(info)
+
+
+def _add_job_gpu_detail(info):
+    """Add normalized GPU count/type fields from TRES or Gres."""
 
     # GPU count + type from TRES, then fall back to Gres field
     tres = info.get("tres") or ""
@@ -484,6 +485,84 @@ def collect_job_detail(jobid):
     info["gpu_count"] = gpu_count
     info["gpu_type"]  = gpu_type
     return info
+
+
+def _parse_sacct_job_detail(text, query_jobid):
+    """Parse the allocation row returned by sacct for a completed job."""
+    fields = [
+        "jobid", "job_name", "user", "account", "qos", "state", "reason",
+        "partition", "priority", "num_nodes", "num_cpus", "num_tasks",
+        "req_cpus", "tres", "runtime", "timelimit", "submit_time",
+        "start_time", "end_time", "nodelist", "exit_code", "req_mem",
+    ]
+    selected = None
+    fallback = None
+    for line in text.splitlines():
+        values = line.rstrip("\n").split("|")
+        if len(values) < len(fields):
+            continue
+        row = dict(zip(fields, values[:len(fields)]))
+        row_id = row["jobid"]
+        if "." in row_id:  # exclude .batch, .extern and other job steps
+            continue
+        if fallback is None:
+            fallback = row
+        if row_id == query_jobid:
+            selected = row
+            break
+    row = selected or fallback
+    if row is None:
+        raise RuntimeError(f"sacct returned no accounting record for job {query_jobid}")
+
+    state = row["state"].split(" ", 1)[0].rstrip("+") or None
+    num_tasks = int(row["num_tasks"]) if row["num_tasks"].isdigit() else 0
+    num_cpus = int(row["num_cpus"]) if row["num_cpus"].isdigit() else 0
+    cpus_task = str(num_cpus // num_tasks) if num_tasks and num_cpus else None
+    info = {key: None for key in _JOB_RE}
+    info.update({
+        "job_name": row["job_name"] or None,
+        "user": row["user"] or None,
+        "account": row["account"] or None,
+        "qos": row["qos"] or None,
+        "state": state,
+        "reason": row["reason"] or None,
+        "partition": row["partition"] or None,
+        "priority": row["priority"] or None,
+        "num_nodes": row["num_nodes"] or None,
+        "num_cpus": row["num_cpus"] or None,
+        "num_tasks": row["num_tasks"] or None,
+        "cpus_task": cpus_task,
+        "tres": row["tres"] or None,
+        "runtime": row["runtime"] or None,
+        "timelimit": row["timelimit"] or None,
+        "submit_time": row["submit_time"] or None,
+        "start_time": row["start_time"] or None,
+        "end_time": row["end_time"] or None,
+        "nodelist": row["nodelist"] or None,
+        "exit_code": row["exit_code"] or None,
+        "mem_cpu": row["req_mem"] or None,
+    })
+    return _add_job_gpu_detail(info)
+
+
+def collect_job_detail(jobid):
+    query_jobid = normalize_job_id(jobid)
+    try:
+        text = _run(["scontrol", "show", "job", query_jobid])
+        return _parse_scontrol_job_detail(text)
+    except subprocess.CalledProcessError:
+        log.debug("scontrol has no live record for job %s; falling back to sacct", query_jobid)
+
+    columns = (
+        "JobID,JobName,User,Account,QOS,State,Reason,Partition,Priority,"
+        "AllocNodes,AllocCPUS,NTasks,ReqCPUS,ReqTRES,Elapsed,Timelimit,"
+        "Submit,Start,End,NodeList,ExitCode,ReqMem"
+    )
+    text = _run([
+        "sacct", "-j", query_jobid, "--noheader", "--parsable2",
+        f"--format={columns}",
+    ])
+    return _parse_sacct_job_detail(text, query_jobid)
 
 
 _JOB_CSS = """\
