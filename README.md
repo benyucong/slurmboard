@@ -15,10 +15,10 @@ Run it directly on a Slurm login node, or launch it from your Mac through an SSH
   - Multi-column sort (click header = primary, Shift+click = secondary)
   - Filter by minimum VRAM and/or "idle GPUs only"
   - Lazy per-partition node loading and async refresh (↻) without losing expand/sort state
-  - Running / pending jobs load only when requested; click to expand the inline list
+  - Adaptive running/pending counts: automatic on smaller clusters and request-driven on larger systems
   - Click any row to load and expand its node details (CPU, memory, GPU idle/total, VRAM)
-- **Job detail page** at `/job/<id>` — full `scontrol` info, linked from job lists
-- **My Jobs panel** — persistent job history (`jobs_history.json`), marks finished jobs as DONE; sortable by state / ID / time / date; shows submit time
+- **Job details** — in-dashboard modal plus `/job/<id>`, with `scontrol` and completed-job `sacct` fallback
+- **My Jobs panel** — seven-day Slurm accounting history; sortable by state / ID / time / date; shows submit time
 - **All progress bars show idle ratio** — green bar = available resources
 - **Storage quota panel** — on-demand disk-space and file-count usage across POSIX/NFS, Lustre, GPFS, BeeGFS, and site-specific HPC tools
 
@@ -78,7 +78,11 @@ The launcher does all of the following for you:
 - lets you pin frequently used hosts to the top; pins persist between launcher runs
 - stops the remote dashboard and tunnel when you click **Stop** or quit the launcher with `Ctrl+C`
 
-SSH authentication must work non-interactively (for example, with macOS Keychain or `ssh-agent`). The launcher automatically chooses a high, temporary port for each connection, so it does not conflict with an already-running dashboard. If you specifically need a fixed remote port, set one explicitly:
+The launcher uses keys, agents, `ProxyJump`, and other options from your SSH
+configuration; password-only hosts can use the session-cached field described
+above. It automatically chooses a high, temporary port for each connection, so
+it does not conflict with an already-running dashboard. If you specifically
+need a fixed remote port, set one explicitly:
 
 ```bash
 ./slurmboard.py --launcher --remote-port 65435
@@ -86,7 +90,7 @@ SSH authentication must work non-interactively (for example, with macOS Keychain
 
 Wildcard-only entries such as `Host *` are not shown because they are SSH defaults rather than connectable host names.
 
-The dashboard refreshes its compact cluster summary every minute by default. Use the **Auto refresh** menu to choose manual refresh, 15 or 30 seconds, or 1, 2, or 5 minutes. The choice is remembered across launcher ports. Automatic refresh skips hidden browser tabs and refreshes the active queue only after you have chosen to load it; job history remains manual because it is a heavier query.
+The dashboard refreshes its compact cluster summary every minute by default. Use the **Auto refresh** menu to choose manual refresh, 15 or 30 seconds, or 1, 2, or 5 minutes. The choice is remembered across launcher ports. Automatic refresh skips hidden browser tabs. Roihu-sized clusters load partition counts and personal jobs automatically; larger clusters keep those panels click-to-load, and later history refreshes remain manual.
 
 Storage quota discovery supports standard `quota`, Lustre `lfs quota`, IBM Storage Scale/GPFS `mmlsquota`, BeeGFS 7 and 8, LUMI tools, and common site wrappers. If a cluster provides another read-only command, pass it explicitly; the launcher forwards it safely to the remote dashboard without using a shell:
 
@@ -99,14 +103,28 @@ Recognized output is displayed as usage bars. Unrecognized output is still shown
 ### Run directly on a login node
 
 ```bash
-# default: bind 0.0.0.0:8000
+# default: bind an available port above 9000
 ./slurmboard.py
 
 # custom port / bind address
-./slurmboard.py --port 9000 --host 127.0.0.1
+./slurmboard.py --port 9100 --host 127.0.0.1
 ```
 
-Open `http://<login-node>:8000` in your browser. Use the ↻ buttons to refresh data without a full page reload.
+When no port is specified, slurmboard first tries port 9001. If it is occupied, the server probes up to 99 additional, non-sequential ports above 9000 using jittered exponential backoff. It prints a forwarding command using the selected port, for example:
+
+```text
+On your local machine, run this SSH forwarding command:
+
+  ssh -N -L 9001:127.0.0.1:9001 <your-ssh-host>
+```
+
+Replace `<your-ssh-host>` with the host or SSH config alias you normally use, then run the command in a terminal on your local computer. For example:
+
+```bash
+ssh -N -L 9001:127.0.0.1:9001 my-cluster
+```
+
+Keep that terminal open, then open `http://127.0.0.1:9001` in your local browser. Use the ↻ buttons to refresh data without a full page reload.
 
 ## How it works
 

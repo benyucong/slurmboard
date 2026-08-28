@@ -3,7 +3,7 @@
 """
 slurmboard - a tiny, dependency-free web dashboard for a Slurm cluster.
 
-Run directly on the Slurm login/submit node (no SSH, no extra packages).
+Run directly on the Slurm login/submit node or access it through SSH forwarding.
 The initial page uses a compact `sinfo` partition summary. Smaller clusters get
 cached resource aggregates and queue counts automatically; larger systems keep
 exact node and queue details request-driven. This makes the dashboard suitable
@@ -11,7 +11,7 @@ for both small clusters and machines with thousands of nodes. There is no
 server-side background polling and no third-party dependency - stdlib only.
 
 Usage:
-    python3 slurmboard.py [--port 8000] [--host 0.0.0.0]
+    python3 slurmboard.py [--port PORT] [--host 0.0.0.0]
 """
 
 import sys
@@ -25,6 +25,7 @@ import html as _html
 import json
 import logging
 import os
+import random
 import re
 import secrets
 import shlex
@@ -1179,15 +1180,39 @@ _JOB_RE = {
 }
 
 
-def collect_job_detail(jobid):
-    if not re.match(r"^\d+(_\d+)?$", str(jobid)):
-        raise ValueError(f"Invalid job ID: {jobid!r}")
-    text = _run(["scontrol", "show", "job", str(jobid)])
+def normalize_job_id(jobid):
+    """Return an scontrol-compatible ID for regular and array jobs."""
+    value = unquote(str(jobid)).strip()
+    if re.fullmatch(r"\d+(?:_\d+)?", value):
+        return value
 
+    match = re.fullmatch(r"(\d+)_\[(\d+)\]", value)
+    if match:
+        return f"{match.group(1)}_{match.group(2)}"
+
+    # squeue compresses pending array ranges (for example 123_[1-20%4]).
+    # scontrol cannot show that expression directly, so query its parent job.
+    match = re.fullmatch(
+        r"(\d+)_\[(\d+(?:-\d+(?::\d+)?)?(?:,\d+(?:-\d+(?::\d+)?)?)*(?:%\d+)?)\]",
+        value,
+    )
+    if match:
+        return match.group(1)
+
+    raise ValueError(f"Invalid job ID: {jobid!r}")
+
+
+def _parse_scontrol_job_detail(text):
     info = {}
     for key, rx in _JOB_RE.items():
         m = rx.search(text)
         info[key] = m.group(1).strip() if m else None
+
+    return _add_job_gpu_detail(info)
+
+
+def _add_job_gpu_detail(info):
+    """Add normalized GPU count/type fields from TRES or Gres."""
 
     # GPU count + type from TRES, then fall back to Gres field
     tres = info.get("tres") or ""
@@ -1209,6 +1234,84 @@ def collect_job_detail(jobid):
     info["gpu_count"] = gpu_count
     info["gpu_type"]  = gpu_type
     return info
+
+
+def _parse_sacct_job_detail(text, query_jobid):
+    """Parse the allocation row returned by sacct for a completed job."""
+    fields = [
+        "jobid", "job_name", "user", "account", "qos", "state", "reason",
+        "partition", "priority", "num_nodes", "num_cpus", "num_tasks",
+        "req_cpus", "tres", "runtime", "timelimit", "submit_time",
+        "start_time", "end_time", "nodelist", "exit_code", "req_mem",
+    ]
+    selected = None
+    fallback = None
+    for line in text.splitlines():
+        values = line.rstrip("\n").split("|")
+        if len(values) < len(fields):
+            continue
+        row = dict(zip(fields, values[:len(fields)]))
+        row_id = row["jobid"]
+        if "." in row_id:  # exclude .batch, .extern and other job steps
+            continue
+        if fallback is None:
+            fallback = row
+        if row_id == query_jobid:
+            selected = row
+            break
+    row = selected or fallback
+    if row is None:
+        raise RuntimeError(f"sacct returned no accounting record for job {query_jobid}")
+
+    state = row["state"].split(" ", 1)[0].rstrip("+") or None
+    num_tasks = int(row["num_tasks"]) if row["num_tasks"].isdigit() else 0
+    num_cpus = int(row["num_cpus"]) if row["num_cpus"].isdigit() else 0
+    cpus_task = str(num_cpus // num_tasks) if num_tasks and num_cpus else None
+    info = {key: None for key in _JOB_RE}
+    info.update({
+        "job_name": row["job_name"] or None,
+        "user": row["user"] or None,
+        "account": row["account"] or None,
+        "qos": row["qos"] or None,
+        "state": state,
+        "reason": row["reason"] or None,
+        "partition": row["partition"] or None,
+        "priority": row["priority"] or None,
+        "num_nodes": row["num_nodes"] or None,
+        "num_cpus": row["num_cpus"] or None,
+        "num_tasks": row["num_tasks"] or None,
+        "cpus_task": cpus_task,
+        "tres": row["tres"] or None,
+        "runtime": row["runtime"] or None,
+        "timelimit": row["timelimit"] or None,
+        "submit_time": row["submit_time"] or None,
+        "start_time": row["start_time"] or None,
+        "end_time": row["end_time"] or None,
+        "nodelist": row["nodelist"] or None,
+        "exit_code": row["exit_code"] or None,
+        "mem_cpu": row["req_mem"] or None,
+    })
+    return _add_job_gpu_detail(info)
+
+
+def collect_job_detail(jobid):
+    query_jobid = normalize_job_id(jobid)
+    try:
+        text = _run(["scontrol", "show", "job", query_jobid])
+        return _parse_scontrol_job_detail(text)
+    except subprocess.CalledProcessError:
+        log.debug("scontrol has no live record for job %s; falling back to sacct", query_jobid)
+
+    columns = (
+        "JobID,JobName,User,Account,QOS,State,Reason,Partition,Priority,"
+        "AllocNodes,AllocCPUS,NTasks,ReqCPUS,ReqTRES,Elapsed,Timelimit,"
+        "Submit,Start,End,NodeList,ExitCode,ReqMem"
+    )
+    text = _run([
+        "sacct", "-j", query_jobid, "--noheader", "--parsable2",
+        f"--format={columns}",
+    ])
+    return _parse_sacct_job_detail(text, query_jobid)
 
 
 _JOB_CSS = """\
@@ -1546,6 +1649,48 @@ PAGE_TEMPLATE = """<!DOCTYPE html>
              font-size: 10px; padding: 2px 7px; border-radius: 4px; cursor: pointer; }
   .uj-sort:hover { color: var(--text); }
   .uj-sort.active { border-color: var(--accent); color: var(--accent); }
+
+  /* in-dashboard job detail dialog */
+  .job-modal { position: fixed; inset: 0; z-index: 1000; display: none;
+               align-items: center; justify-content: center; padding: 28px;
+               background: rgba(0,0,0,.55); backdrop-filter: blur(2px); }
+  .job-modal.open { display: flex; }
+  .job-dialog { width: min(960px, 100%); max-height: min(820px, calc(100vh - 56px));
+                overflow-x: hidden; overflow-y: auto; background: var(--bg); border: 1px solid var(--border);
+                border-radius: 14px; box-shadow: 0 24px 80px rgba(0,0,0,.45); }
+  .job-dialog-head { position: sticky; top: 0; z-index: 1; display: flex;
+                     align-items: center; gap: 10px; padding: 16px 18px;
+                     background: var(--bg); border-bottom: 1px solid var(--border); }
+  .job-dialog-title { font-size: 18px; font-weight: 700; }
+  .job-dialog-close { margin-left: auto; width: 30px; height: 30px; border-radius: 50%;
+                      border: 1px solid var(--border); background: var(--panel);
+                      color: var(--text); cursor: pointer; font-size: 18px; line-height: 1; }
+  .job-dialog-body { padding: 18px; }
+  .job-dialog-name { color: var(--muted); margin: -8px 0 14px; }
+  .job-dialog-error { color: var(--bad); padding: 22px 0; text-align: center; }
+  .job-dialog-title .running, .job-dialog-title .completing {
+    background: rgba(62,201,124,.15); color: var(--good);
+  }
+  .job-dialog-title .pending { background: rgba(240,169,63,.15); color: var(--warn); }
+  .job-dialog-title .completed { background: rgba(79,140,255,.15); color: var(--accent); }
+  .job-dialog-title .failed, .job-dialog-title .cancelled,
+  .job-dialog-title .timeout, .job-dialog-title .node_fail {
+    background: rgba(239,91,91,.15); color: var(--bad);
+  }
+  .job-grid { display: grid; grid-template-columns: repeat(auto-fit,minmax(280px,1fr)); gap: 12px; }
+  .job-card { background: var(--panel); border: 1px solid var(--border);
+              border-radius: 10px; padding: 14px; }
+  .job-card.full { grid-column: 1/-1; }
+  .job-card-title { color: var(--muted); font-size: 11px; text-transform: uppercase;
+                    letter-spacing: .05em; margin-bottom: 8px; font-weight: 600; }
+  .job-card table { border: 0; border-radius: 0; font-size: 13px; }
+  .job-card td { padding: 5px 0; white-space: normal; vertical-align: top; }
+  .job-card td:first-child { width: 105px; color: var(--muted); padding-right: 12px; white-space: nowrap; }
+  .job-card td:last-child { min-width: 0; overflow-wrap: anywhere; word-break: break-word; }
+  .job-card code { white-space: normal; overflow-wrap: anywhere; word-break: break-word; }
+  .job-reason { color: var(--warn); background: rgba(240,169,63,.1);
+                border: 1px solid rgba(240,169,63,.3); border-radius: 6px;
+                padding: 8px 12px; margin-bottom: 14px; }
 </style>
 </head>
 <body>
@@ -1642,6 +1787,16 @@ PAGE_TEMPLATE = """<!DOCTYPE html>
   </div>
 </main>
 <footer>slurmboard &middot; data sourced live from <code>sinfo</code> / <code>scontrol</code> on this login node</footer>
+
+<div class="job-modal" id="job-modal" role="dialog" aria-modal="true" aria-labelledby="job-dialog-title">
+  <div class="job-dialog">
+    <div class="job-dialog-head">
+      <div class="job-dialog-title" id="job-dialog-title">Job details</div>
+      <button class="job-dialog-close" id="job-dialog-close" aria-label="Close job details">×</button>
+    </div>
+    <div class="job-dialog-body" id="job-dialog-body"></div>
+  </div>
+</div>
 
 <script>
 let SNAPSHOT = __SNAPSHOT_JSON__;
@@ -1975,6 +2130,74 @@ function statePill(state) {
 function minibar(pct, cls='') {
   return `<span class="minibar ${cls}"><span style="width:${pct}%"></span></span>`;
 }
+
+// ── job detail modal ───────────────────────────────────────────────────────
+const jobModal = document.getElementById('job-modal');
+const jobDialogTitle = document.getElementById('job-dialog-title');
+const jobDialogBody = document.getElementById('job-dialog-body');
+
+function escapeHtml(value) {
+  return String(value == null ? '' : value).replace(/[&<>"']/g, ch => ({
+    '&':'&amp;', '<':'&lt;', '>':'&gt;', '"':'&quot;', "'":'&#39;'
+  })[ch]);
+}
+
+function jobValue(value) {
+  return value == null || value === '' || value === '(null)' || value === 'N/A'
+    ? '—' : escapeHtml(value);
+}
+
+function jobCard(title, rows, full=false) {
+  const body = rows.filter(([, value]) => value != null && value !== '' && value !== '(null)' && value !== 'N/A')
+    .map(([label, value, code]) => `<tr><td>${escapeHtml(label)}</td><td>${code ? `<code>${jobValue(value)}</code>` : jobValue(value)}</td></tr>`)
+    .join('');
+  if (!body) return '';
+  return `<section class="job-card${full ? ' full' : ''}"><div class="job-card-title">${escapeHtml(title)}</div><table><tbody>${body}</tbody></table></section>`;
+}
+
+function closeJobModal() {
+  jobModal.classList.remove('open');
+}
+
+async function openJobModal(jobID) {
+  jobDialogTitle.textContent = `Job ${jobID}`;
+  jobDialogBody.innerHTML = '<div class="muted" style="padding:22px 0;text-align:center">Loading…</div>';
+  jobModal.classList.add('open');
+  try {
+    const response = await fetch(`/api/job/${encodeURIComponent(jobID)}`);
+    const payload = await response.json();
+    if (!response.ok || payload.error) throw new Error(payload.error || `HTTP ${response.status}`);
+    const info = payload.job;
+    const state = (info.state || 'UNKNOWN').toUpperCase();
+    const stateClass = ['running','completing','pending','completed','failed','cancelled','timeout','node_fail']
+      .includes(state.toLowerCase()) ? state.toLowerCase() : 'other';
+    const gpu = info.gpu_count ? `${info.gpu_count}× ${info.gpu_type || 'gpu'}` : null;
+    const reason = info.reason && info.reason !== 'None' && info.reason !== '(null)'
+      ? `<div class="job-reason">Reason: ${escapeHtml(info.reason)}</div>` : '';
+    jobDialogTitle.innerHTML = `Job ${escapeHtml(jobID)} <span class="pill ${stateClass}">${escapeHtml(state)}</span>`;
+    jobDialogBody.innerHTML = `
+      <div class="job-dialog-name">${jobValue(info.job_name)}</div>${reason}
+      <div class="job-grid">
+        ${jobCard('Identity', [['User',info.user],['Account',info.account],['QOS',info.qos],['Partition',info.partition],['Priority',info.priority],['Exit code',info.exit_code]])}
+        ${jobCard('Resources', [['Nodes',info.num_nodes],['CPUs',info.num_cpus],['Tasks',info.num_tasks],['CPUs / task',info.cpus_task],['GPUs',gpu],['Memory',info.mem_cpu || info.mem_node],['TRES',info.tres]])}
+        ${jobCard('Timing', [['Submit',info.submit_time],['Start',info.start_time],['End',info.end_time],['Run time',info.runtime],['Time limit',info.timelimit]])}
+        ${jobCard('Nodes', [['Node list',info.nodelist],['Batch host',info.batch_host]])}
+        ${jobCard('Paths', [['Work dir',info.workdir,true],['Command',info.command,true],['Stdout',info.stdout,true],['Stderr',info.stderr,true]], true)}
+      </div>`;
+  } catch (error) {
+    jobDialogBody.innerHTML = `<div class="job-dialog-error">${escapeHtml(error.message)}</div>`;
+  }
+}
+
+document.addEventListener('click', event => {
+  const link = event.target.closest('a.uj-id');
+  if (!link || event.button !== 0 || event.metaKey || event.ctrlKey || event.shiftKey || event.altKey) return;
+  event.preventDefault();
+  openJobModal(link.textContent.trim());
+});
+document.getElementById('job-dialog-close').addEventListener('click', closeJobModal);
+jobModal.addEventListener('click', event => { if (event.target === jobModal) closeJobModal(); });
+document.addEventListener('keydown', event => { if (event.key === 'Escape' && jobModal.classList.contains('open')) closeJobModal(); });
 
 // ── multi-column sort ───────────────────────────────────────────────────────
 // Array of {key, dir} objects; first entry = primary sort.
@@ -2765,6 +2988,24 @@ class Handler(BaseHTTPRequestHandler):
             self.send_header("Content-Type",   "text/html; charset=utf-8")
             self.send_header("Content-Length", str(len(body)))
             self.send_header("Cache-Control",  "no-store")
+            self.end_headers()
+            self.wfile.write(body)
+        elif path.startswith("/api/job/"):
+            jobid = path[len("/api/job/"):].strip("/")
+            try:
+                body = json.dumps({"job": collect_job_detail(jobid)}).encode("utf-8")
+                status = 200
+            except ValueError as exc:
+                body = json.dumps({"error": str(exc)}).encode("utf-8")
+                status = 400
+            except Exception as exc:
+                log.error("collect_job_detail failed for %r: %s", jobid, exc, exc_info=True)
+                body = json.dumps({"error": str(exc)}).encode("utf-8")
+                status = 500
+            self.send_response(status)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Cache-Control", "no-store")
             self.end_headers()
             self.wfile.write(body)
         elif path.startswith("/job/"):
@@ -3571,12 +3812,47 @@ def run_launcher(args):
         httpd.server_close()
 
 
+def create_http_server(host, requested_port=None, max_attempts=100):
+    """Bind the requested port, or probe up to 100 non-sequential ports."""
+    if requested_port is not None:
+        return ThreadingHTTPServer((host, requested_port), Handler)
+
+    # Try the predictable default first, then avoid a slow sequential scan by
+    # sampling unique ports from the remaining valid range. Brief jittered
+    # exponential backoff prevents simultaneous launches from retrying in lockstep.
+    candidates = [9001]
+    remaining_attempts = max(0, min(max_attempts, 100) - 1)
+    candidates.extend(random.SystemRandom().sample(range(9002, 65536), remaining_attempts))
+    for attempt, port in enumerate(candidates):
+        try:
+            return ThreadingHTTPServer((host, port), Handler)
+        except OSError as exc:
+            if exc.errno == errno.EADDRINUSE:
+                if attempt + 1 < len(candidates):
+                    ceiling = min(0.001 * (2 ** attempt), 0.1)
+                    time.sleep(random.SystemRandom().uniform(0, ceiling))
+                continue
+            raise
+    raise RuntimeError(f"no available TCP port found above 9000 after {len(candidates)} attempts")
+
+
+def print_forwarding_instructions(port):
+    command = f"ssh -N -L {port}:127.0.0.1:{port} <your-ssh-host>"
+    print("\nOn your local machine, run this SSH forwarding command:", file=sys.stderr)
+    print(f"\n  {command}\n", file=sys.stderr)
+    print("Then open:", file=sys.stderr)
+    print(f"\n  http://127.0.0.1:{port}\n", file=sys.stderr)
+    print("Replace <your-ssh-host> with the host or SSH config alias you normally use.\n",
+          file=sys.stderr, flush=True)
+
+
 def main():
     global _QUOTA_COMMAND
     ap = argparse.ArgumentParser(
         description="Tiny Slurm cluster dashboard, with an optional local SSH launcher.")
     ap.add_argument("--host",      default="0.0.0.0",  help="bind address (default: 0.0.0.0)")
-    ap.add_argument("--port",      type=int, default=8000, help="bind port (default: 8000)")
+    ap.add_argument("--port", type=int, default=None,
+                    help="bind port (default: an available port above 9000)")
     ap.add_argument("--launcher", action="store_true",
                     help="run the local SSH host launcher on this computer")
     ap.add_argument("--launcher-port", type=int, default=65432,
@@ -3607,8 +3883,10 @@ def main():
         run_launcher(args)
         return
 
-    httpd = ThreadingHTTPServer((args.host, args.port), Handler)
-    log.info("slurmboard listening on http://%s:%d", args.host, args.port)
+    httpd = create_http_server(args.host, args.port)
+    port = httpd.server_address[1]
+    log.info("slurmboard listening on http://%s:%d", args.host, port)
+    print_forwarding_instructions(port)
     try:
         httpd.serve_forever()
     except KeyboardInterrupt:

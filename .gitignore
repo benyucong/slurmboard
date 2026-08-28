@@ -2,3 +2,8 @@ __pycache__/
 *.py[cod]
 *.log
 jobs_history.json
+issues/
+.claude/
+.DS_Store
+SlurmboardApp/.build/
+SlurmboardApp/Slurmboard.app/
