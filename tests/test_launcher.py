@@ -1,5 +1,7 @@
 import importlib.util
 import io
+import json
+import stat
 import tempfile
 import unittest
 from pathlib import Path
@@ -95,7 +97,88 @@ class LauncherConnectionTests(unittest.TestCase):
             self.assertIn("127.0.0.1:65534:127.0.0.1:65535", command)
             self.assertIn("--host 127.0.0.1 --port 65535", command[-1])
             self.assertTrue(popen.call_args.kwargs["stdin"].closed)
+            self.assertNotIn("env", popen.call_args.kwargs)
             self.assertEqual(thread.call_count, 2)
+
+    def test_connect_caches_successful_password_via_ssh_askpass(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config = Path(temp_dir) / "config"
+            config.write_text("Host kosh_3080\n", encoding="utf-8")
+            state = SLURMBOARD.LauncherState(
+                ROOT / "slurmboard.py", config, remote_port=65535,
+                state_path=Path(temp_dir) / "launcher.json",
+            )
+            process = mock.Mock()
+            process.poll.return_value = None
+            process.stderr = []
+
+            with mock.patch.object(
+                SLURMBOARD, "_available_loopback_port", return_value=65534
+            ), mock.patch.object(
+                SLURMBOARD.subprocess, "Popen", return_value=process
+            ) as popen, mock.patch.object(
+                SLURMBOARD.threading, "Thread"
+            ):
+                state.connect("kosh_3080", password="correct horse battery staple")
+
+            command = popen.call_args.args[0]
+            environment = popen.call_args.kwargs["env"]
+            password_file = Path(environment["SLURMBOARD_ASKPASS_FILE"])
+            askpass_file = Path(environment["SSH_ASKPASS"])
+            auth_dir = password_file.parent
+
+            self.assertIn("BatchMode=no", command)
+            self.assertIn("NumberOfPasswordPrompts=1", command)
+            self.assertNotIn("correct horse battery staple", " ".join(command))
+            self.assertNotIn("correct horse battery staple", environment.values())
+            self.assertEqual(password_file.read_text(encoding="utf-8"),
+                             "correct horse battery staple")
+            self.assertEqual(stat.S_IMODE(password_file.stat().st_mode), 0o600)
+            self.assertEqual(stat.S_IMODE(askpass_file.stat().st_mode), 0o700)
+            self.assertNotIn("correct horse battery staple", json.dumps(state.view()))
+            self.assertFalse(state.view()["hosts"][0]["password_cached"])
+
+            state._mark_connected(state.connections["kosh_3080"])
+            self.assertTrue(state.view()["hosts"][0]["password_cached"])
+            self.assertEqual(
+                state.password_cache["kosh_3080"], "correct horse battery staple"
+            )
+            state._clear_auth(state.connections["kosh_3080"])
+            self.assertFalse(auth_dir.exists())
+
+            state.forget_password("kosh_3080")
+            self.assertFalse(state.view()["hosts"][0]["password_cached"])
+
+    def test_connect_reuses_cached_password_when_field_is_blank(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config = Path(temp_dir) / "config"
+            config.write_text("Host kosh_3080\n", encoding="utf-8")
+            state = SLURMBOARD.LauncherState(
+                ROOT / "slurmboard.py", config, remote_port=65535,
+                state_path=Path(temp_dir) / "launcher.json",
+            )
+            state.password_cache["kosh_3080"] = "session secret"
+            process = mock.Mock()
+            process.poll.return_value = None
+            process.stderr = []
+
+            with mock.patch.object(
+                SLURMBOARD, "_available_loopback_port", return_value=65534
+            ), mock.patch.object(
+                SLURMBOARD.subprocess, "Popen", return_value=process
+            ) as popen, mock.patch.object(SLURMBOARD.threading, "Thread"):
+                state.connect("kosh_3080")
+
+            command = popen.call_args.args[0]
+            environment = popen.call_args.kwargs["env"]
+            password_file = Path(environment["SLURMBOARD_ASKPASS_FILE"])
+            connection = state.connections["kosh_3080"]
+            self.assertIn("BatchMode=no", command)
+            self.assertEqual(password_file.read_text(encoding="utf-8"),
+                             "session secret")
+            self.assertTrue(connection["used_cached_password"])
+            self.assertIsNone(connection["pending_password"])
+            state._clear_auth(connection)
 
     def test_connect_selects_a_remote_port_automatically(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -126,6 +209,31 @@ class LauncherConnectionTests(unittest.TestCase):
                 f"127.0.0.1:54000:127.0.0.1:{selected_port}", command
             )
             self.assertIn(f"--port {selected_port}", command[-1])
+
+    def test_connect_forwards_a_custom_quota_command(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config = Path(temp_dir) / "config"
+            config.write_text("Host general-hpc\n", encoding="utf-8")
+            state = SLURMBOARD.LauncherState(
+                ROOT / "slurmboard.py", config, remote_port=65535,
+                state_path=Path(temp_dir) / "launcher.json",
+                quota_command="site-quota --format compact",
+            )
+            process = mock.Mock()
+            process.poll.return_value = None
+            process.stderr = []
+
+            with mock.patch.object(
+                SLURMBOARD, "_available_loopback_port", return_value=54000
+            ), mock.patch.object(
+                SLURMBOARD.subprocess, "Popen", return_value=process
+            ) as popen, mock.patch.object(SLURMBOARD.threading, "Thread"):
+                state.connect("general-hpc")
+
+            remote_command = popen.call_args.args[0][-1]
+            self.assertIn(
+                "--quota-command 'site-quota --format compact'", remote_command
+            )
 
     def test_port_collision_has_a_retry_message(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -210,6 +318,59 @@ class LauncherPinTests(unittest.TestCase):
 
             with self.assertRaisesRegex(ValueError, "not a concrete alias"):
                 state.set_pinned("missing", True)
+
+
+class LauncherPasswordUITests(unittest.TestCase):
+    def test_launcher_offers_a_session_cached_password_field(self):
+        page = SLURMBOARD._LAUNCHER_PAGE
+
+        self.assertIn("SSH password (optional)", page)
+        self.assertIn("passwordInput.type = 'password'", page)
+        self.assertIn("passwordInput.autocomplete = 'current-password'", page)
+        self.assertIn("Cached in memory until the launcher quits.", page)
+        self.assertIn("Cached after a successful connection", page)
+        self.assertIn("Forget cached password", page)
+        self.assertIn("passwordInput.value = '';", page)
+
+    def test_connect_endpoint_passes_password_without_returning_it(self):
+        state = mock.Mock()
+        state.token = "token"
+        state.view.return_value = {"hosts": []}
+        body = json.dumps({"host": "kosh_3080", "password": "secret"}).encode()
+        handler = object.__new__(SLURMBOARD.LauncherHandler)
+        handler.path = "/api/connect"
+        handler.state = state
+        handler.headers = {
+            "X-Slurmboard-Token": "token",
+            "Content-Length": str(len(body)),
+        }
+        handler.rfile = io.BytesIO(body)
+        handler._json = mock.Mock()
+
+        handler.do_POST()
+
+        state.connect.assert_called_once_with("kosh_3080", password="secret")
+        handler._json.assert_called_once_with(200, {"hosts": []})
+
+    def test_forget_password_endpoint_clears_the_host_cache(self):
+        state = mock.Mock()
+        state.token = "token"
+        state.view.return_value = {"hosts": []}
+        body = json.dumps({"host": "kosh_3080"}).encode()
+        handler = object.__new__(SLURMBOARD.LauncherHandler)
+        handler.path = "/api/forget-password"
+        handler.state = state
+        handler.headers = {
+            "X-Slurmboard-Token": "token",
+            "Content-Length": str(len(body)),
+        }
+        handler.rfile = io.BytesIO(body)
+        handler._json = mock.Mock()
+
+        handler.do_POST()
+
+        state.forget_password.assert_called_once_with("kosh_3080")
+        handler._json.assert_called_once_with(200, {"hosts": []})
 
 
 class LauncherStartupTests(unittest.TestCase):

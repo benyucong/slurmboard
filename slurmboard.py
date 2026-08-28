@@ -4,10 +4,11 @@
 slurmboard - a tiny, dependency-free web dashboard for a Slurm cluster.
 
 Run directly on the Slurm login/submit node (no SSH, no extra packages).
-The initial page uses a compact `sinfo` partition summary. Exact node and queue
-details are fetched only when requested and cached briefly, making the dashboard
-suitable for both small clusters and machines with thousands of nodes. There is
-no background polling and no third-party package dependency - stdlib only.
+The initial page uses a compact `sinfo` partition summary. Smaller clusters get
+cached resource aggregates and queue counts automatically; larger systems keep
+exact node and queue details request-driven. This makes the dashboard suitable
+for both small clusters and machines with thousands of nodes. There is no
+server-side background polling and no third-party dependency - stdlib only.
 
 Usage:
     python3 slurmboard.py [--port 8000] [--host 0.0.0.0]
@@ -27,8 +28,10 @@ import os
 import re
 import secrets
 import shlex
+import shutil
 import socket
 import subprocess
+import tempfile
 import getpass
 import threading
 import time
@@ -44,6 +47,10 @@ _SLURM_QUERY_LOCK = threading.RLock()
 _CACHE_LOCK = threading.RLock()
 _CACHE = {}
 _PARTITION_NODELISTS = {}
+_QUOTA_COMMAND = None
+_NODE_ENRICH_LIMIT = 1000
+_NODE_ENRICH_TTL = 60
+_PARTITION_JOBS_TTL = 20
 
 # ---------------------------------------------------------------------------
 # Data collection
@@ -98,6 +105,311 @@ def _cached(key, ttl, loader, refresh=False):
         return value
 
 
+_ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
+_SCALED_AMOUNT_RE = re.compile(
+    r"^([0-9]+(?:[.,][0-9]+)?)([KMGTPE]?)(?:I?B)?$", re.IGNORECASE
+)
+_LUMI_QUOTA_ROW_RE = re.compile(
+    r"^\s*(/\S+)\s+"
+    r"([0-9][0-9.,]*\s*[KMGTPE]?(?:i?B)?)\s*/\s*"
+    r"([0-9][0-9.,]*\s*[KMGTPE]?(?:i?B)?)\s+"
+    r"([0-9][0-9.,]*\s*[KMGTPE]?)\s*/\s*"
+    r"([0-9][0-9.,]*\s*[KMGTPE]?)\s*$",
+    re.IGNORECASE,
+)
+
+
+def _scaled_amount(value, binary):
+    """Parse quota values such as ``1.7G``, ``43K``, or ``158M``."""
+    compact = str(value).strip().replace(" ", "").replace("\u00a0", "")
+    if compact in ("", "-", "none", "unlimited"):
+        return None
+    match = _SCALED_AMOUNT_RE.fullmatch(compact)
+    if not match:
+        return None
+    number = float(match.group(1).replace(",", "."))
+    exponent = "KMGTPE".find(match.group(2).upper()) + 1 if match.group(2) else 0
+    return int(number * ((1024 if binary else 1000) ** exponent))
+
+
+def _quota_row(scope, path, space_used_label, space_limit_label,
+               files_used_label, files_limit_label):
+    space_used = _scaled_amount(space_used_label, binary=True)
+    space_limit = _scaled_amount(space_limit_label, binary=True)
+    files_used = _scaled_amount(files_used_label, binary=False)
+    files_limit = _scaled_amount(files_limit_label, binary=False)
+    return {
+        "scope": scope or "User",
+        "path": path,
+        "space_used": space_used,
+        "space_limit": space_limit if space_limit else None,
+        "space_used_label": space_used_label,
+        "space_limit_label": (space_limit_label if space_limit else
+                              "unlimited" if str(space_limit_label).lower() == "unlimited" else "—"),
+        "space_percent": round(space_used / space_limit * 100, 1)
+        if space_used is not None and space_limit else None,
+        "files_used": files_used,
+        "files_limit": files_limit if files_limit else None,
+        "files_used_label": files_used_label,
+        "files_limit_label": (files_limit_label if files_limit else
+                              "unlimited" if str(files_limit_label).lower() == "unlimited" else "—"),
+        "files_percent": round(files_used / files_limit * 100, 1)
+        if files_used is not None and files_limit else None,
+    }
+
+
+def parse_lumi_quota(text):
+    """Parse the compact path/space/files rows printed by LUMI quota tools."""
+    rows = []
+    scope = "User"
+    clean = _ANSI_ESCAPE_RE.sub("", text)
+    for raw_line in clean.splitlines():
+        line = raw_line.strip()
+        if line.lower().startswith("personal home"):
+            scope = "Personal home"
+            continue
+        if line.lower().startswith("project:"):
+            scope = line.split(":", 1)[1].strip() or "Project"
+            continue
+        match = _LUMI_QUOTA_ROW_RE.match(raw_line)
+        if match:
+            rows.append(_quota_row(scope, *match.groups()))
+    return rows
+
+
+def parse_posix_quota(text):
+    """Parse Triton's user/group ``quota`` table, including inode limits."""
+    rows = []
+    section = "User"
+    clean = _ANSI_ESCAPE_RE.sub("", text)
+    for raw_line in clean.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        if line.lower().startswith("group quotas"):
+            section = "Group"
+            continue
+        fields = line.split()
+        if not fields or not fields[0].startswith("/"):
+            continue
+
+        amount_index = None
+        for index, field in enumerate(fields[1:], 1):
+            if _scaled_amount(field, binary=True) is not None:
+                amount_index = index
+                break
+        if amount_index is None:
+            continue
+        values = fields[amount_index:]
+        if len(values) < 6:
+            continue
+
+        space_used_label, space_quota_label, space_hard_label = values[:3]
+        position = 3
+        if position < len(values) and _scaled_amount(values[position], binary=False) is None:
+            position += 1  # optional grace-period column
+        if len(values) < position + 3:
+            continue
+        files_used_label, files_quota_label, files_hard_label = values[position:position + 3]
+
+        space_limit_label = (space_quota_label
+                             if _scaled_amount(space_quota_label, True)
+                             else space_hard_label)
+        files_limit_label = (files_quota_label
+                             if _scaled_amount(files_quota_label, False)
+                             else files_hard_label)
+        qualifier = " ".join(fields[1:amount_index])
+        scope = f"{section}: {qualifier}" if qualifier else section
+        rows.append(_quota_row(
+            scope, fields[0], space_used_label, space_limit_label,
+            files_used_label, files_limit_label,
+        ))
+    return rows
+
+
+def parse_gpfs_quota(text):
+    """Parse IBM Storage Scale/GPFS ``mmlsquota`` block and file limits."""
+    rows = []
+    clean = _ANSI_ESCAPE_RE.sub("", text)
+    for raw_line in clean.splitlines():
+        if "|" not in raw_line:
+            continue
+        block_side, file_side = raw_line.split("|", 1)
+        blocks = block_side.split()
+        files = file_side.split()
+        type_index = next(
+            (index for index, value in enumerate(blocks)
+             if value.upper() in ("USR", "GRP", "FILESET")),
+            None,
+        )
+        if type_index is None or len(blocks) < type_index + 4 or len(files) < 3:
+            continue
+        prefix = blocks[:type_index]
+        if not prefix:
+            continue
+        filesystem = prefix[0]
+        fileset = prefix[1] if len(prefix) > 1 else ""
+        quota_type = blocks[type_index].upper()
+        space_used_label, space_quota_label, space_hard_label = blocks[type_index + 1:type_index + 4]
+        files_used_label, files_quota_label, files_hard_label = files[:3]
+        if (_scaled_amount(space_used_label, True) is None or
+                _scaled_amount(files_used_label, False) is None):
+            continue
+
+        # Plain numeric mmlsquota block values are KiB; --block-size auto adds units.
+        def block_label(value):
+            return value if re.search(r"[A-Za-z]", value) else value + "K"
+
+        space_used_label = block_label(space_used_label)
+        space_quota_label = block_label(space_quota_label)
+        space_hard_label = block_label(space_hard_label)
+        space_limit_label = (space_quota_label
+                             if _scaled_amount(space_quota_label, True)
+                             else space_hard_label)
+        files_limit_label = (files_quota_label
+                             if _scaled_amount(files_quota_label, False)
+                             else files_hard_label)
+        path = filesystem + (":" + fileset if fileset else "")
+        scope = {"USR": "User", "GRP": "Group", "FILESET": "Fileset"}[quota_type]
+        rows.append(_quota_row(
+            scope, path, space_used_label, space_limit_label,
+            files_used_label, files_limit_label,
+        ))
+    return rows
+
+
+def parse_beegfs_quota(text):
+    """Parse BeeGFS quota tables from storage pools (BeeGFS 7 and 8)."""
+    rows = []
+    pool = "BeeGFS"
+    clean = _ANSI_ESCAPE_RE.sub("", text)
+    for raw_line in clean.splitlines():
+        line = raw_line.strip()
+        pool_match = re.search(r"storage pool\s+(.+?)(?:\s*\(ID:|:|$)", line, re.IGNORECASE)
+        if pool_match:
+            pool = pool_match.group(1).strip()
+            continue
+        fields = [field.strip() for field in line.split("|")]
+        if len(fields) < 8 or fields[2] != "" or fields[5] != "":
+            continue
+        if _scaled_amount(fields[3], True) is None:
+            continue
+        identity = fields[0] or fields[1] or "User"
+        rows.append(_quota_row(
+            f"User: {identity}", f"BeeGFS pool {pool}",
+            fields[3], fields[4], fields[6], fields[7],
+        ))
+    return rows
+
+
+def parse_quota_output(text):
+    """Try all known structured formats; callers retain raw output as fallback."""
+    for parser in (parse_lumi_quota, parse_beegfs_quota,
+                   parse_gpfs_quota, parse_posix_quota):
+        rows = parser(text)
+        if rows:
+            return rows
+    return []
+
+
+def _run_quota(command):
+    completed = subprocess.run(
+        command, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        text=True, check=True, timeout=20,
+    )
+    return completed.stdout
+
+
+def _quota_candidates():
+    """Return safe, read-only quota commands available on this cluster."""
+    if _QUOTA_COMMAND:
+        command = shlex.split(_QUOTA_COMMAND)
+        if not command:
+            raise ValueError("--quota-command must contain a command")
+        return [("custom", command)]
+
+    candidates = []
+    commands = [
+        ("lumi-workspaces", ["lumi-workspaces"]),
+        ("lumi-quota", ["lumi-quota"]),
+        ("myquota", ["myquota"]),
+        ("showquota", ["showquota"]),
+        ("checkquota", ["checkquota"]),
+        ("quota", ["quota"]),
+        ("mmlsquota", ["mmlsquota", "--block-size", "auto"]),
+        ("beegfs", ["beegfs", "quota", "list-usage", "--type=user",
+                    f"--ids={os.getuid()}"]),
+        ("beegfs-ctl", ["beegfs-ctl", "--getquota", "--uid", str(os.getuid())]),
+        ("lfs", ["lfs", "quota"]),
+    ]
+    for source, command in commands:
+        if shutil.which(command[0]):
+            candidates.append((source, command))
+    return candidates
+
+
+def collect_storage_quota():
+    """Collect quotas from common HPC filesystems, with raw fallback."""
+    try:
+        candidates = _quota_candidates()
+    except ValueError as exc:
+        return {
+            "generated_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "source": "custom", "rows": [], "raw": None, "error": str(exc),
+        }
+    if not candidates:
+        return {
+            "generated_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "source": None, "rows": [], "raw": None,
+            "error": ("No supported quota command was found. Configure this cluster with "
+                      "--quota-command if it provides a site-specific quota tool."),
+        }
+
+    first_raw = None
+    failures = []
+    for source, command in candidates:
+        try:
+            output = _run_quota(command)
+        except subprocess.TimeoutExpired:
+            failures.append(f"{source} timed out")
+            if _QUOTA_COMMAND:
+                break
+            continue
+        except subprocess.CalledProcessError as exc:
+            details = (exc.stderr or "").strip()
+            failures.append(details or f"{source} exited with status {exc.returncode}")
+            if _QUOTA_COMMAND:
+                break
+            continue
+
+        output = output.strip()
+        if not output:
+            continue
+        rows = parse_quota_output(output)
+        if rows:
+            return {
+                "generated_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+                "source": source, "rows": rows, "raw": None, "error": None,
+            }
+        if first_raw is None:
+            first_raw = (source, output[:100000])
+
+    if first_raw:
+        return {
+            "generated_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "source": first_raw[0], "rows": [], "raw": first_raw[1], "error": None,
+        }
+    return {
+        "generated_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "source": candidates[0][0], "rows": [], "raw": None,
+        "error": "; ".join(failures[:3]) or "Quota commands returned no data.",
+    }
+
+
+def build_storage_quota(refresh=False):
+    return _cached("storage-quota", 300, collect_storage_quota, refresh=refresh)
+
+
 def _gpu_total_from_gres(gres):
     if not gres or gres == "(null)":
         return None, 0
@@ -139,6 +451,9 @@ _GPU_VRAM_GB = {
     "mi100":  32,
     "h100":  80,
     "h200": 141,
+    "gh200": 96,
+    "l40":   48,
+    "l40s":  48,
 }
 
 def _vram_gb_from_gres(gres):
@@ -473,10 +788,145 @@ def collect_partition_summaries():
     return summary, [partitions[name] for name in sorted(partitions)]
 
 
+def collect_compact_node_resources():
+    """Collect exact resource usage with one compact ``sinfo -N`` query."""
+    text = _run([
+        "sinfo", "-N", "-e", "-h", "-O",
+        "NodeList:128,Partition:64,StateCompact:16,CPUsState:32,Memory:16,"
+        "AllocMem:16,Gres:256,GresUsed:256",
+    ])
+    nodes = {}
+    for raw_line in text.splitlines():
+        fields = raw_line.split()
+        if len(fields) < 8:
+            continue
+        name, partition, state, cpus, memory, alloc_memory, gres, gres_used = fields[:8]
+        partition = partition.rstrip("*")
+        cpu_alloc, cpu_idle, _cpu_other, cpu_total = _cpu_state_counts(cpus)
+        gpu_type, gpu_total = _gpu_total_from_gres(gres)
+        _used_type, gpu_alloc = _gpu_total_from_gres(gres_used)
+        node = nodes.get(name)
+        if node is not None:
+            if partition and partition not in node["partitions"]:
+                node["partitions"].append(partition)
+            continue
+        nodes[name] = {
+            "name": name,
+            "state": state.rstrip("*+~#$@").upper() or "UNKNOWN",
+            "partitions": [partition] if partition else [],
+            "cpu_alloc": cpu_alloc,
+            "cpu_idle": cpu_idle,
+            "cpu_total": cpu_total,
+            "load": None,
+            "mem_alloc_mb": _int_prefix(alloc_memory),
+            "mem_total_mb": _int_prefix(memory),
+            "gpu_type": gpu_type,
+            "gpu_alloc": gpu_alloc,
+            "gpu_idle": max(gpu_total - gpu_alloc, 0),
+            "gpu_total": gpu_total,
+            "gpu_vram_gb": _vram_gb_from_gres(gres),
+        }
+    return list(nodes.values())
+
+
+def _apply_compact_node_resources(summary, partitions, nodes):
+    """Fill aggregate blanks from exact nodes without exposing the node list."""
+    if not nodes:
+        return
+
+    summary.update({
+        "cpu_alloc": sum(node["cpu_alloc"] for node in nodes),
+        "cpu_total": sum(node["cpu_total"] for node in nodes),
+        "mem_alloc_mb": sum(node["mem_alloc_mb"] for node in nodes),
+        "mem_total_mb": sum(node["mem_total_mb"] for node in nodes),
+        "gpu_alloc": sum(node["gpu_alloc"] for node in nodes),
+        "gpu_total": sum(node["gpu_total"] for node in nodes),
+        "node_count": len(nodes),
+        "node_states": {},
+        "gpu_by_type": {},
+        "lazy": False,
+    })
+    for node in nodes:
+        state = node["state"]
+        summary["node_states"][state] = summary["node_states"].get(state, 0) + 1
+        if not node["gpu_total"]:
+            continue
+        gpu_type = node["gpu_type"] or "gpu"
+        bucket = summary["gpu_by_type"].setdefault(
+            gpu_type, {"alloc": 0, "total": 0, "nodes": 0, "partitions": {}}
+        )
+        bucket["alloc"] += node["gpu_alloc"]
+        bucket["total"] += node["gpu_total"]
+        bucket["nodes"] += 1
+        for partition in node["partitions"]:
+            part_bucket = bucket["partitions"].setdefault(
+                partition, {"alloc": 0, "total": 0}
+            )
+            part_bucket["alloc"] += node["gpu_alloc"]
+            part_bucket["total"] += node["gpu_total"]
+
+    nodes_by_partition = {}
+    for node in nodes:
+        for partition in node["partitions"]:
+            nodes_by_partition.setdefault(partition, []).append(node)
+
+    for partition in partitions:
+        part_nodes = nodes_by_partition.get(partition["name"], [])
+        if not part_nodes:
+            continue
+        vram_values = [node["gpu_vram_gb"] for node in part_nodes if node["gpu_vram_gb"]]
+        states = {}
+        for node in part_nodes:
+            states[node["state"]] = states.get(node["state"], 0) + 1
+        partition.update({
+            "nodes": len(part_nodes),
+            "cpu_alloc": sum(node["cpu_alloc"] for node in part_nodes),
+            "cpu_total": sum(node["cpu_total"] for node in part_nodes),
+            "mem_alloc_mb": sum(node["mem_alloc_mb"] for node in part_nodes),
+            "mem_total_mb": sum(node["mem_total_mb"] for node in part_nodes),
+            "gpu_alloc": sum(node["gpu_alloc"] for node in part_nodes),
+            "gpu_total": sum(node["gpu_total"] for node in part_nodes),
+            "gpu_vram_gb": max(vram_values) if vram_values else None,
+            "states": states,
+        })
+        partition["gpu_idle"] = max(
+            partition["gpu_total"] - partition["gpu_alloc"], 0
+        )
+
+
+def _apply_partition_jobs(partitions, job_counts):
+    """Attach one cluster-wide queue snapshot to all partition rows."""
+    for partition in partitions:
+        counts = job_counts.get(partition["name"], {})
+        partition.update({
+            "jobs_running": counts.get("running", 0),
+            "jobs_pending": counts.get("pending", 0),
+            "jobs": counts.get("jobs", []),
+            "jobs_loaded": True,
+        })
+
+
 def build_cluster_summary(refresh=False):
     def load():
         started = time.monotonic()
         summary, partitions = collect_partition_summaries()
+        if 0 < summary["node_count"] <= _NODE_ENRICH_LIMIT:
+            try:
+                nodes = _cached(
+                    "compact-node-resources", _NODE_ENRICH_TTL,
+                    collect_compact_node_resources,
+                )
+                _apply_compact_node_resources(summary, partitions, nodes)
+            except (OSError, subprocess.SubprocessError) as exc:
+                log.warning("exact resource enrichment unavailable: %s", exc)
+            try:
+                job_counts = _cached(
+                    "all-partition-jobs", _PARTITION_JOBS_TTL,
+                    collect_job_counts,
+                )
+                _apply_partition_jobs(partitions, job_counts)
+            except (OSError, subprocess.SubprocessError) as exc:
+                log.warning("automatic partition jobs unavailable: %s", exc)
         log.info(
             "compact cluster summary in %.2fs — %d nodes, %d partitions",
             time.monotonic() - started, summary["node_count"], len(partitions),
@@ -670,7 +1120,7 @@ def collect_active_queue(current_user):
 
 
 def build_snapshot():
-    """Fast initial page: compact cluster summary; personal data loads async."""
+    """Adaptive initial page: restore full panels where cluster size permits."""
     current_user = getpass.getuser()
     snap = dict(build_cluster_summary())
     snap["current_user"] = current_user
@@ -678,6 +1128,18 @@ def build_snapshot():
     snap["active_queue_loaded"] = False
     snap["user_jobs"] = []
     snap["user_jobs_loaded"] = False
+    snap["auto_load_personal"] = (
+        0 < snap.get("summary", {}).get("node_count", 0) <= _NODE_ENRICH_LIMIT
+    )
+    if snap["auto_load_personal"]:
+        try:
+            snap["active_queue"] = _cached(
+                ("active-queue", current_user), 10,
+                lambda: collect_active_queue(current_user),
+            )
+            snap["active_queue_loaded"] = True
+        except (OSError, subprocess.SubprocessError) as exc:
+            log.warning("automatic active queue unavailable: %s", exc)
     return snap
 
 
@@ -1046,6 +1508,27 @@ PAGE_TEMPLATE = """<!DOCTYPE html>
   /* compact tables in left/right sidebars */
   .left-col table { font-size: 12px; }
   .left-col th, .left-col td { padding: 5px 8px; }
+  .quota-refresh { border: 0; background: transparent; color: var(--muted); cursor: pointer;
+                   font: inherit; padding: 0 2px; }
+  .quota-refresh:hover { color: var(--accent); }
+  .quota-refresh.loading { color: var(--accent); opacity: .5; pointer-events: none; }
+  #quota-table th { cursor: default; }
+  #quota-table td { vertical-align: top; }
+  .quota-scope { color: var(--text); font-weight: 600; max-width: 130px;
+                 overflow: hidden; text-overflow: ellipsis; }
+  .quota-path { color: var(--muted); font-size: 10px; max-width: 130px;
+                overflow: hidden; text-overflow: ellipsis; }
+  .quota-value { font-variant-numeric: tabular-nums; font-size: 11px; }
+  .quota-meter { width: 72px; height: 4px; margin-top: 4px; border-radius: 2px;
+                 background: var(--bar-track); overflow: hidden; }
+  .quota-meter span { display: block; height: 100%; background: var(--good); }
+  .quota-meter.high span { background: var(--warn); }
+  .quota-meter.crit span { background: var(--bad); }
+  .quota-meta { color: var(--muted); font-size: 10px; margin-top: 6px; }
+  .quota-error { color: var(--bad); font-size: 12px; white-space: pre-wrap; }
+  .quota-raw { margin: 0; padding: 8px; border: 1px solid var(--border); border-radius: 6px;
+               background: var(--panel); color: var(--muted); font-size: 10px;
+               white-space: pre-wrap; overflow-wrap: anywhere; }
 
   /* user jobs table — same padding as partition table */
   #aq-table th, #aq-table td, #hist-table th, #hist-table td { padding: 5px 7px; }
@@ -1104,6 +1587,11 @@ PAGE_TEMPLATE = """<!DOCTYPE html>
         </tr></thead>
         <tbody></tbody>
       </table>
+
+      <h2>Storage quota
+        <button id="quota-refresh-btn" class="quota-refresh" title="Load storage quota" aria-label="Load storage quota">&#x21bb;</button>
+      </h2>
+      <div id="quota-panel"><p class="muted" style="font-size:12px">Click ↻ to load disk and file quotas.</p></div>
     </aside>
     <div class="col-resizer" id="resizer-left" title="Drag to resize"></div>
     <section class="center-col">
@@ -1310,6 +1798,106 @@ async function refreshHistoryJobs(force=false) {
     console.error('userjobs refresh failed:', e);
   }
   if (btn) btn.classList.remove('loading');
+}
+
+// ── storage quota (lazy because cluster quota helpers can be slow) ─────────
+let QUOTA_DATA = null;
+let quotaLoading = false;
+
+function appendQuotaUsage(cell, usedLabel, limitLabel, percent) {
+  const value = document.createElement('div');
+  value.className = 'quota-value';
+  value.textContent = `${usedLabel} / ${limitLabel}`;
+  cell.appendChild(value);
+  if (percent == null) return;
+  const meter = document.createElement('div');
+  meter.className = `quota-meter ${percent >= 90 ? 'crit' : percent >= 70 ? 'high' : ''}`;
+  meter.title = `${percent}% used`;
+  const fill = document.createElement('span');
+  fill.style.width = `${Math.min(percent, 100)}%`;
+  meter.appendChild(fill);
+  cell.appendChild(meter);
+}
+
+function renderStorageQuota() {
+  const panel = document.getElementById('quota-panel');
+  panel.replaceChildren();
+  if (!QUOTA_DATA) {
+    const prompt = document.createElement('p');
+    prompt.className = 'muted';
+    prompt.style.fontSize = '12px';
+    prompt.textContent = 'Click ↻ to load disk and file quotas.';
+    panel.appendChild(prompt);
+    return;
+  }
+  if (QUOTA_DATA.error) {
+    const error = document.createElement('p');
+    error.className = 'quota-error';
+    error.textContent = QUOTA_DATA.error;
+    panel.appendChild(error);
+    return;
+  }
+  if (QUOTA_DATA.rows && QUOTA_DATA.rows.length) {
+    const table = document.createElement('table');
+    table.id = 'quota-table';
+    table.innerHTML = '<thead><tr><th>Storage</th><th>Space</th><th>Files</th></tr></thead>';
+    const body = document.createElement('tbody');
+    for (const row of QUOTA_DATA.rows) {
+      const tr = document.createElement('tr');
+      const location = document.createElement('td');
+      const scope = document.createElement('div');
+      scope.className = 'quota-scope';
+      scope.textContent = row.scope;
+      scope.title = row.scope;
+      const path = document.createElement('div');
+      path.className = 'quota-path';
+      path.textContent = row.path;
+      path.title = row.path;
+      location.append(scope, path);
+      const space = document.createElement('td');
+      appendQuotaUsage(space, row.space_used_label, row.space_limit_label, row.space_percent);
+      const files = document.createElement('td');
+      appendQuotaUsage(files, row.files_used_label, row.files_limit_label, row.files_percent);
+      tr.append(location, space, files);
+      body.appendChild(tr);
+    }
+    table.appendChild(body);
+    panel.appendChild(table);
+  } else if (QUOTA_DATA.raw) {
+    const raw = document.createElement('pre');
+    raw.className = 'quota-raw';
+    raw.textContent = QUOTA_DATA.raw;
+    panel.appendChild(raw);
+  } else {
+    const empty = document.createElement('p');
+    empty.className = 'muted';
+    empty.textContent = 'No quota entries were returned.';
+    panel.appendChild(empty);
+  }
+  const meta = document.createElement('div');
+  meta.className = 'quota-meta';
+  meta.textContent = `${QUOTA_DATA.source || 'quota'} · ${QUOTA_DATA.generated_at}`;
+  panel.appendChild(meta);
+}
+
+async function refreshStorageQuota(force=true) {
+  if (quotaLoading) return;
+  quotaLoading = true;
+  const button = document.getElementById('quota-refresh-btn');
+  button.classList.add('loading');
+  try {
+    const response = await fetch('/data/quota' + (force ? '?refresh=1' : ''));
+    const data = await response.json();
+    if (!response.ok) throw new Error(data.error || `HTTP ${response.status}`);
+    QUOTA_DATA = data;
+  } catch (error) {
+    QUOTA_DATA = {error: error.message};
+    console.error('storage quota refresh failed:', error);
+  } finally {
+    quotaLoading = false;
+    button.classList.remove('loading');
+    renderStorageQuota();
+  }
 }
 
 // ── configurable dashboard auto-refresh ───────────────────────────────────
@@ -2104,6 +2692,7 @@ document.getElementById('idle-only').addEventListener('change', renderPartitions
 initColumnResizers();
 document.getElementById('aq-refresh-btn').addEventListener('click', () => refreshActiveQueue(true));
 document.getElementById('hist-refresh-btn').addEventListener('click', () => refreshHistoryJobs(true));
+document.getElementById('quota-refresh-btn').addEventListener('click', () => refreshStorageQuota(true));
 document.getElementById('dashboard-refresh').addEventListener('click', refreshDashboard);
 document.getElementById('refresh-interval').addEventListener('change', e => {
   setRefreshInterval(Number(e.target.value));
@@ -2111,7 +2700,12 @@ document.getElementById('refresh-interval').addEventListener('change', e => {
 renderPartitions();
 renderActiveQueue();
 renderHistoryJobs();
+renderStorageQuota();
 setRefreshInterval(readRefreshPreference(), false);
+if (SNAPSHOT.auto_load_personal) {
+  if (!SNAPSHOT.active_queue_loaded) refreshActiveQueue(false);
+  refreshHistoryJobs(false);
+}
 </script>
 </body>
 </html>
@@ -2252,6 +2846,12 @@ class Handler(BaseHTTPRequestHandler):
             self.send_header("Cache-Control",  "no-store")
             self.end_headers()
             self.wfile.write(body)
+        elif path == "/data/quota":
+            try:
+                self._send_json(200, build_storage_quota(refresh=refresh))
+            except Exception as exc:
+                log.error("storage quota query failed: %s", exc, exc_info=True)
+                self._send_json(500, {"error": str(exc)})
         else:
             body = b"not found"
             self.send_response(404)
@@ -2318,6 +2918,15 @@ _LAUNCHER_PAGE = """<!DOCTYPE html>
   .dot.error { background:var(--bad); }
   .status { color:var(--muted); font-size:12px; margin-left:auto; text-transform:capitalize; }
   .actions { display:flex; gap:8px; }
+  .auth { margin:0 0 11px; }
+  .auth label { display:block; color:var(--muted); font-size:12px; margin-bottom:5px; }
+  .password-input { width:100%; border:1px solid var(--border); border-radius:7px;
+                    background:#0f1115; color:var(--text); padding:8px 10px; font:inherit; }
+  .password-input:focus { outline:2px solid color-mix(in srgb, var(--accent) 55%, transparent);
+                          border-color:var(--accent); }
+  .auth-note { color:var(--muted); font-size:11px; margin-top:4px; }
+  .forget-password { border:0; background:transparent; color:var(--muted); padding:0;
+                     font-size:11px; text-decoration:underline; }
   .error { color:var(--bad); font-size:12px; margin-top:11px; white-space:pre-wrap;
            overflow-wrap:anywhere; }
   .empty { color:var(--muted); background:var(--panel); border:1px solid var(--border);
@@ -2405,10 +3014,47 @@ function render(data) {
       open.target = '_blank';
       actions.appendChild(open);
       actions.appendChild(button('Stop', 'danger', () => act('/api/disconnect', host.host)));
+      if (host.password_cached) {
+        actions.appendChild(button('Forget password', 'forget-password',
+          () => act('/api/forget-password', host.host)));
+      }
     } else if (host.status === 'connecting' || host.status === 'stopping') {
       actions.appendChild(button(host.status === 'connecting' ? 'Connecting…' : 'Stopping…', 'primary', () => {}, true));
     } else {
-      actions.appendChild(button('Connect', 'primary', () => act('/api/connect', host.host)));
+      const auth = document.createElement('div');
+      auth.className = 'auth';
+      const passwordLabel = document.createElement('label');
+      passwordLabel.textContent = 'SSH password (optional)';
+      const passwordInput = document.createElement('input');
+      passwordInput.className = 'password-input';
+      passwordInput.type = 'password';
+      passwordInput.autocomplete = 'current-password';
+      passwordInput.placeholder = host.password_cached
+        ? 'Cached — leave blank to reuse'
+        : 'Leave blank to use your SSH key';
+      passwordLabel.htmlFor = `password-${host.host}`;
+      passwordInput.id = passwordLabel.htmlFor;
+      const note = document.createElement('div');
+      note.className = 'auth-note';
+      note.textContent = host.password_cached
+        ? 'Cached in memory until the launcher quits.'
+        : 'Cached after a successful connection until the launcher quits.';
+      auth.append(passwordLabel, passwordInput, note);
+      if (host.password_cached) {
+        auth.appendChild(button('Forget cached password', 'forget-password',
+          () => act('/api/forget-password', host.host)));
+      }
+      card.appendChild(auth);
+
+      const connect = () => {
+        const password = passwordInput.value;
+        passwordInput.value = '';
+        act('/api/connect', host.host, {password});
+      };
+      passwordInput.addEventListener('keydown', event => {
+        if (event.key === 'Enter') connect();
+      });
+      actions.appendChild(button('Connect', 'primary', connect));
     }
     card.appendChild(actions);
     if (host.error) {
@@ -2423,6 +3069,7 @@ function render(data) {
 
 async function load() {
   if (busy) return;
+  if (document.activeElement?.classList.contains('password-input')) return;
   try { render(await request('/api/hosts')); }
   catch (error) { root.textContent = error.message; }
 }
@@ -2513,15 +3160,18 @@ def _available_loopback_port(start):
 
 
 class LauncherState:
-    def __init__(self, script_path, config_path, remote_port, state_path=None):
+    def __init__(self, script_path, config_path, remote_port, state_path=None,
+                 quota_command=None):
         self.script_path = Path(script_path).resolve()
         self.config_path = Path(config_path).expanduser()
         self.state_path = (Path(state_path).expanduser() if state_path else
                            Path.home() / ".config" / "slurmboard" / "launcher.json")
         self.remote_port = remote_port
+        self.quota_command = quota_command
         self.hosts = []
         self.config_error = None
         self.connections = {}
+        self.password_cache = {}
         self.pinned_hosts = []
         self.token = secrets.token_urlsafe(32)
         self.lock = threading.RLock()
@@ -2584,13 +3234,15 @@ class LauncherState:
         conn = self.connections.get(host)
         if not conn:
             return {"host": host, "status": "idle", "url": None, "error": None,
-                    "pinned": host in self.pinned_hosts}
+                    "pinned": host in self.pinned_hosts,
+                    "password_cached": host in self.password_cache}
         return {
             "host": host,
             "status": conn["status"],
             "url": f"http://127.0.0.1:{conn['local_port']}" if conn["status"] == "connected" else None,
             "error": conn.get("error") or None,
             "pinned": host in self.pinned_hosts,
+            "password_cached": host in self.password_cache,
         }
 
     def view(self, refresh=False):
@@ -2608,26 +3260,32 @@ class LauncherState:
                 "hosts": [self._connection_view(host) for host in visible_hosts],
             }
 
-    def connect(self, host):
+    def connect(self, host, password=None):
         with self.lock:
             if host not in self.hosts:
                 raise ValueError("That host is not a concrete alias in the configured SSH file")
             previous = self.connections.get(host)
             if previous and previous["process"].poll() is None:
                 return
+            entered_password = password
+            if password is None:
+                password = self.password_cache.get(host)
+            used_cached_password = bool(password and entered_password is None)
             remote_port = self.remote_port or 49152 + secrets.randbelow(65536 - 49152)
             preferred_local_port = remote_port if remote_port >= 49152 else 65535
             local_port = _available_loopback_port(preferred_local_port)
 
+        quota_option = (f" --quota-command {shlex.quote(self.quota_command)}"
+                        if self.quota_command else "")
         remote_command = (
             'exec "$(command -v python3.13 || command -v python3.12 || '
             'command -v python3.11 || command -v python3.10 || command -v python3.9 || '
             'command -v python3.8 || command -v python3.7 || echo python3)" '
-            f'- --host 127.0.0.1 --port {remote_port} --log-level warning'
+            f'- --host 127.0.0.1 --port {remote_port}{quota_option} --log-level warning'
         )
         ssh_command = [
             "ssh", "-T",
-            "-o", "BatchMode=yes",
+            "-o", f"BatchMode={'no' if password else 'yes'}",
             "-o", "ExitOnForwardFailure=yes",
             "-o", "ConnectTimeout=10",
             "-o", "ServerAliveInterval=30",
@@ -2636,18 +3294,51 @@ class LauncherState:
             "--", host, remote_command,
         ]
 
+        auth_dir = None
+        ssh_environment = None
+        if password:
+            try:
+                auth_dir = Path(tempfile.mkdtemp(prefix="slurmboard-askpass-"))
+                password_file = auth_dir / "password"
+                askpass_file = auth_dir / "askpass"
+                password_file.write_text(password, encoding="utf-8")
+                password_file.chmod(0o600)
+                askpass_file.write_text(
+                    '#!/bin/sh\nexec /bin/cat "$SLURMBOARD_ASKPASS_FILE"\n',
+                    encoding="utf-8",
+                )
+                askpass_file.chmod(0o700)
+                ssh_environment = os.environ.copy()
+                ssh_environment.update({
+                    "SSH_ASKPASS": str(askpass_file),
+                    "SSH_ASKPASS_REQUIRE": "force",
+                    "DISPLAY": ssh_environment.get("DISPLAY") or ":0",
+                    "SLURMBOARD_ASKPASS_FILE": str(password_file),
+                })
+                ssh_command[4:4] = ["-o", "NumberOfPasswordPrompts=1"]
+            except Exception:
+                if auth_dir:
+                    shutil.rmtree(auth_dir, ignore_errors=True)
+                raise
+
         source = self.script_path.open("rb")
         try:
-            process = subprocess.Popen(
-                ssh_command,
-                stdin=source,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.PIPE,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
-                start_new_session=True,
-            )
+            try:
+                process = subprocess.Popen(
+                    ssh_command,
+                    stdin=source,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                    encoding="utf-8",
+                    errors="replace",
+                    start_new_session=True,
+                    **({"env": ssh_environment} if ssh_environment else {}),
+                )
+            except Exception:
+                if auth_dir:
+                    shutil.rmtree(auth_dir, ignore_errors=True)
+                raise
         finally:
             source.close()
 
@@ -2660,6 +3351,10 @@ class LauncherState:
             "error": "",
             "stderr": [],
             "intentional_stop": False,
+            "auth_dir": auth_dir,
+            "pending_password": entered_password,
+            "used_cached_password": used_cached_password,
+            "authentication_succeeded": False,
         }
         with self.lock:
             self.connections[host] = conn
@@ -2688,9 +3383,8 @@ class LauncherState:
                 response = health.getresponse()
                 response.read()
                 if response.status == 200:
-                    with self.lock:
-                        if not conn["intentional_stop"]:
-                            conn["status"] = "connected"
+                    self._mark_connected(conn)
+                    self._clear_auth(conn)
                     break
             except Exception:
                 time.sleep(0.25)
@@ -2704,14 +3398,18 @@ class LauncherState:
             process.terminate()
 
         return_code = process.wait()
+        self._clear_auth(conn)
         time.sleep(0.05)  # let the stderr reader collect the final SSH message
         with self.lock:
+            conn.pop("pending_password", None)
             if conn["intentional_stop"]:
                 conn["status"] = "idle"
                 conn["error"] = ""
             else:
                 conn["status"] = "error"
                 details = "\n".join(conn["stderr"])
+                if conn.get("used_cached_password") and "Permission denied" in details:
+                    self.password_cache.pop(conn["host"], None)
                 if "Address already in use" in details:
                     if self.remote_port:
                         conn["error"] = (
@@ -2725,6 +3423,28 @@ class LauncherState:
                         )
                 else:
                     conn["error"] = details or f"SSH exited with status {return_code}"
+
+    def _mark_connected(self, conn):
+        with self.lock:
+            if conn["intentional_stop"]:
+                return
+            conn["status"] = "connected"
+            conn["authentication_succeeded"] = True
+            entered_password = conn.pop("pending_password", None)
+            if entered_password:
+                self.password_cache[conn["host"]] = entered_password
+
+    def forget_password(self, host):
+        with self.lock:
+            if host not in self.hosts:
+                raise ValueError("That host is not a concrete alias in the configured SSH file")
+            self.password_cache.pop(host, None)
+
+    def _clear_auth(self, conn):
+        with self.lock:
+            auth_dir = conn.pop("auth_dir", None)
+        if auth_dir:
+            shutil.rmtree(auth_dir, ignore_errors=True)
 
     def disconnect(self, host):
         with self.lock:
@@ -2746,6 +3466,8 @@ class LauncherState:
                 conn["process"].wait(timeout=2)
             except subprocess.TimeoutExpired:
                 conn["process"].kill()
+        with self.lock:
+            self.password_cache.clear()
 
 
 class LauncherHandler(BaseHTTPRequestHandler):
@@ -2779,7 +3501,8 @@ class LauncherHandler(BaseHTTPRequestHandler):
             self._json(404, {"error": "Not found"})
 
     def do_POST(self):
-        if self.path not in ("/api/connect", "/api/disconnect", "/api/pin"):
+        if self.path not in ("/api/connect", "/api/disconnect", "/api/pin",
+                             "/api/forget-password"):
             self._json(404, {"error": "Not found"})
             return
         if self.headers.get("X-Slurmboard-Token") != self.state.token:
@@ -2794,9 +3517,14 @@ class LauncherHandler(BaseHTTPRequestHandler):
             if not isinstance(host, str):
                 raise ValueError("Missing SSH host")
             if self.path == "/api/connect":
-                self.state.connect(host)
+                password = payload.get("password", "")
+                if not isinstance(password, str) or len(password) > 4096:
+                    raise ValueError("Invalid SSH password")
+                self.state.connect(host, password=password or None)
             elif self.path == "/api/disconnect":
                 self.state.disconnect(host)
+            elif self.path == "/api/forget-password":
+                self.state.forget_password(host)
             else:
                 pinned = payload.get("pinned")
                 if not isinstance(pinned, bool):
@@ -2816,6 +3544,7 @@ def run_launcher(args):
     state = LauncherState(
         __file__, args.ssh_config, args.remote_port,
         state_path=getattr(args, "launcher_state", None),
+        quota_command=getattr(args, "quota_command", None),
     )
     LauncherHandler.state = state
     try:
@@ -2843,6 +3572,7 @@ def run_launcher(args):
 
 
 def main():
+    global _QUOTA_COMMAND
     ap = argparse.ArgumentParser(
         description="Tiny Slurm cluster dashboard, with an optional local SSH launcher.")
     ap.add_argument("--host",      default="0.0.0.0",  help="bind address (default: 0.0.0.0)")
@@ -2857,12 +3587,15 @@ def main():
                     help="fixed remote dashboard port (default: choose automatically)")
     ap.add_argument("--ssh-config", default="~/.ssh/config",
                     help="OpenSSH config used by the launcher (default: ~/.ssh/config)")
+    ap.add_argument("--quota-command", default=None,
+                    help="custom read-only quota command for site-specific HPC storage")
     ap.add_argument("--no-browser", action="store_true",
                     help="do not automatically open the launcher page")
     ap.add_argument("--log-level", default="info",
                     choices=["debug", "info", "warning", "error"],
                     help="log verbosity (default: info)")
     args = ap.parse_args()
+    _QUOTA_COMMAND = args.quota_command
 
     logging.basicConfig(
         level=getattr(logging, args.log_level.upper()),

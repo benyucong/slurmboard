@@ -20,6 +20,7 @@ Run it directly on a Slurm login node, or launch it from your Mac through an SSH
 - **Job detail page** at `/job/<id>` — full `scontrol` info, linked from job lists
 - **My Jobs panel** — persistent job history (`jobs_history.json`), marks finished jobs as DONE; sortable by state / ID / time / date; shows submit time
 - **All progress bars show idle ratio** — green bar = available resources
+- **Storage quota panel** — on-demand disk-space and file-count usage across POSIX/NFS, Lustre, GPFS, BeeGFS, and site-specific HPC tools
 
 ## Installation
 
@@ -61,6 +62,14 @@ Host roihu-gpu
     IdentityFile ~/.ssh/id_ed25519
 ```
 
+If a host uses password authentication, enter it in that host card before
+clicking **Connect**. The password is sent only to the launcher on
+`127.0.0.1`. After a successful connection it is cached in memory for that host
+and reused when reconnecting, but it is never added to the command line, logs,
+SSH config, or launcher preferences. Click **Forget password** to clear it, or
+quit the launcher to clear all cached passwords. Leave the field blank before
+the first connection to use your normal SSH key or agent.
+
 The launcher does all of the following for you:
 
 - uses the host's existing SSH settings, including `ProxyJump`, identity files, and included config files
@@ -78,6 +87,14 @@ SSH authentication must work non-interactively (for example, with macOS Keychain
 Wildcard-only entries such as `Host *` are not shown because they are SSH defaults rather than connectable host names.
 
 The dashboard refreshes its compact cluster summary every minute by default. Use the **Auto refresh** menu to choose manual refresh, 15 or 30 seconds, or 1, 2, or 5 minutes. The choice is remembered across launcher ports. Automatic refresh skips hidden browser tabs and refreshes the active queue only after you have chosen to load it; job history remains manual because it is a heavier query.
+
+Storage quota discovery supports standard `quota`, Lustre `lfs quota`, IBM Storage Scale/GPFS `mmlsquota`, BeeGFS 7 and 8, LUMI tools, and common site wrappers. If a cluster provides another read-only command, pass it explicitly; the launcher forwards it safely to the remote dashboard without using a shell:
+
+```bash
+./slurmboard.py --launcher --quota-command "site-quota --human-readable"
+```
+
+Recognized output is displayed as usage bars. Unrecognized output is still shown verbatim in the quota panel, making proprietary site commands usable without adding a parser first.
 
 ### Run directly on a login node
 
@@ -99,18 +116,29 @@ The first page load makes one compact, partition-oriented query:
 sinfo -h -o "%P|%a|%l|..."  # aggregate partition/resource summary
 ```
 
+On clusters with up to 1,000 nodes, slurmboard also makes one compact node query
+and caches it for a minute. This fills exact memory allocation, GPU allocation,
+idle-GPU, and per-model VRAM fields on clusters such as Roihu. Larger systems
+keep the partition-only path so dashboards such as LUMI remain responsive.
+The smaller-cluster path also restores automatic partition job counts and the
+personal active queue, then loads recent history asynchronously after the page
+appears. Those panels stay click-to-load on larger systems.
+
 Additional commands are scoped and loaded asynchronously:
 
 ```
+sinfo -N -e                  # cached exact resources on clusters up to 1,000 nodes
 sinfo -N -e -p <partition>   # exact nodes only after expanding a partition
+squeue                       # cached partition counts on clusters up to 1,000 nodes
 squeue -p <partition>        # jobs only after clicking “load jobs”
 squeue -u <user>             # personal active queue
 sacct -u <user>              # personal seven-day history
+quota / filesystem tools     # storage and file quotas, only when requested
 ```
 
-Results are cached for 10–60 seconds to absorb repeated clicks and concurrent requests are serialized to avoid bursts against the Slurm controller. The frontend is vanilla JS — no framework or build step. Only the compact cluster summary polls at the selected automatic-refresh interval (one minute by default); node details, partition jobs, and job history remain request-driven.
+Results are cached to absorb repeated clicks and concurrent Slurm requests are serialized to avoid bursts against the controller. Storage quotas are cached for five minutes and loaded only when you click their refresh button. The frontend is vanilla JS — no framework or build step. Only the compact cluster summary polls at the selected automatic-refresh interval (one minute by default). On smaller clusters its cached partition job counts and an already-open active queue refresh with it; exact node details, quotas, and later history refreshes remain request-driven.
 
-Job history is persisted to `jobs_history.json` (same directory as the script, gitignored) so completed jobs remain visible in My Jobs for 7 days.
+Job history is read from Slurm accounting (`sacct`) for the last seven days.
 
 ## Typical workflow
 
