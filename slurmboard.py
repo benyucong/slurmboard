@@ -178,8 +178,23 @@ def parse_lumi_quota(text):
     return rows
 
 
+def _humanize_kib_blocks(value):
+    """Label a plain ``quota`` block count, whose unit is one KiB."""
+    raw = str(value).strip()
+    if not re.fullmatch(r"\d+", raw):
+        return raw
+    amount = float(int(raw))
+    units = "KMGTPE"
+    unit_index = 0
+    while amount >= 1024 and unit_index < len(units) - 1:
+        amount /= 1024
+        unit_index += 1
+    number = f"{amount:.1f}".rstrip("0").rstrip(".")
+    return number + units[unit_index]
+
+
 def parse_posix_quota(text):
-    """Parse Triton's user/group ``quota`` table, including inode limits."""
+    """Parse standard user/group ``quota`` tables, including inode limits."""
     rows = []
     section = "User"
     clean = _ANSI_ESCAPE_RE.sub("", text)
@@ -205,7 +220,9 @@ def parse_posix_quota(text):
         if len(values) < 6:
             continue
 
-        space_used_label, space_quota_label, space_hard_label = values[:3]
+        space_used_label, space_quota_label, space_hard_label = (
+            _humanize_kib_blocks(value) for value in values[:3]
+        )
         position = 3
         if position < len(values) and _scaled_amount(values[position], binary=False) is None:
             position += 1  # optional grace-period column
@@ -213,12 +230,16 @@ def parse_posix_quota(text):
             continue
         files_used_label, files_quota_label, files_hard_label = values[position:position + 3]
 
-        space_limit_label = (space_quota_label
-                             if _scaled_amount(space_quota_label, True)
-                             else space_hard_label)
-        files_limit_label = (files_quota_label
-                             if _scaled_amount(files_quota_label, False)
-                             else files_hard_label)
+        space_limit_label = (
+            space_quota_label if _scaled_amount(space_quota_label, True)
+            else space_hard_label if _scaled_amount(space_hard_label, True)
+            else "unlimited"
+        )
+        files_limit_label = (
+            files_quota_label if _scaled_amount(files_quota_label, False)
+            else files_hard_label if _scaled_amount(files_hard_label, False)
+            else "unlimited"
+        )
         qualifier = " ".join(fields[1:amount_index])
         scope = f"{section}: {qualifier}" if qualifier else section
         rows.append(_quota_row(
@@ -336,6 +357,7 @@ def _quota_candidates():
         ("myquota", ["myquota"]),
         ("showquota", ["showquota"]),
         ("checkquota", ["checkquota"]),
+        ("quota", ["quota", "-s"]),
         ("quota", ["quota"]),
         ("mmlsquota", ["mmlsquota", "--block-size", "auto"]),
         ("beegfs", ["beegfs", "quota", "list-usage", "--type=user",
