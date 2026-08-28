@@ -3,14 +3,15 @@
 """
 slurmboard - a tiny, dependency-free web dashboard for a Slurm cluster.
 
-Run directly on the Slurm login/submit node (no SSH, no extra packages).
+Run directly on the Slurm login/submit node and access it through SSH port
+forwarding. No extra packages are required.
 Each time the page is loaded (i.e. the user hits refresh in the browser),
 the server shells out to `sinfo` / `scontrol`, parses partition/node/GPU
 (gres) usage, and renders a single self-contained HTML page. No background
 polling, no caching, no third-party packages - stdlib only.
 
 Usage:
-    python3 slurmboard.py [--port 8000] [--host 0.0.0.0]
+    python3 slurmboard.py [--port PORT] [--host 0.0.0.0]
 """
 
 import sys
@@ -18,13 +19,16 @@ if sys.version_info < (3, 7):
     sys.exit(f"slurmboard requires Python 3.7+, got {sys.version}")
 
 import argparse
+import errno
 import html as _html
 import json
 import logging
 import os
+import random
 import re
 import subprocess
 import getpass
+import socket
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
@@ -1760,11 +1764,47 @@ class Handler(BaseHTTPRequestHandler):
         log.debug("http: %s %s", self.address_string(), fmt % args)
 
 
+def create_http_server(host, requested_port=None, max_attempts=100):
+    """Bind the requested port, or probe up to 100 non-sequential ports."""
+    if requested_port is not None:
+        return ThreadingHTTPServer((host, requested_port), Handler)
+
+    # Try the predictable default first, then avoid a slow sequential scan by
+    # sampling unique ports from the remaining valid range. Brief jittered
+    # exponential backoff prevents simultaneous launches from retrying in lockstep.
+    candidates = [9001]
+    remaining_attempts = max(0, min(max_attempts, 100) - 1)
+    candidates.extend(random.SystemRandom().sample(range(9002, 65536), remaining_attempts))
+    for attempt, port in enumerate(candidates):
+        try:
+            return ThreadingHTTPServer((host, port), Handler)
+        except OSError as exc:
+            if exc.errno == errno.EADDRINUSE:
+                if attempt + 1 < len(candidates):
+                    ceiling = min(0.001 * (2 ** attempt), 0.1)
+                    time.sleep(random.SystemRandom().uniform(0, ceiling))
+                continue
+            raise
+    raise RuntimeError(f"no available TCP port found above 9000 after {len(candidates)} attempts")
+
+
+def print_forwarding_instructions(port):
+    login_target = f"{getpass.getuser()}@{socket.getfqdn()}"
+    command = f"ssh -N -L {port}:127.0.0.1:{port} {login_target}"
+    print("\nOn your local machine, run this SSH forwarding command:", file=sys.stderr)
+    print(f"\n  {command}\n", file=sys.stderr)
+    print("Then open:", file=sys.stderr)
+    print(f"\n  http://127.0.0.1:{port}\n", file=sys.stderr)
+    print("If you normally connect with an SSH config alias, replace "
+          f"'{login_target}' with that alias.\n", file=sys.stderr, flush=True)
+
+
 def main():
     ap = argparse.ArgumentParser(
         description="Tiny Slurm cluster dashboard (run on the login node).")
     ap.add_argument("--host",      default="0.0.0.0",  help="bind address (default: 0.0.0.0)")
-    ap.add_argument("--port",      type=int, default=8000, help="bind port (default: 8000)")
+    ap.add_argument("--port", type=int, default=None,
+                    help="bind port (default: an available port above 9000)")
     ap.add_argument("--log-level", default="info",
                     choices=["debug", "info", "warning", "error"],
                     help="log verbosity (default: info)")
@@ -1776,8 +1816,10 @@ def main():
         datefmt="%H:%M:%S",
     )
 
-    httpd = ThreadingHTTPServer((args.host, args.port), Handler)
-    log.info("slurmboard listening on http://%s:%d", args.host, args.port)
+    httpd = create_http_server(args.host, args.port)
+    port = httpd.server_address[1]
+    log.info("slurmboard listening on http://%s:%d", args.host, port)
+    print_forwarding_instructions(port)
     try:
         httpd.serve_forever()
     except KeyboardInterrupt:

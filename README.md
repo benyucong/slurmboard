@@ -2,7 +2,7 @@
 
 A lightweight, dependency-free web dashboard for Slurm clusters.
 
-Deploy directly on the Slurm login node — no SSH tunneling, no extra packages, just Python 3 stdlib.
+Deploy directly on the Slurm login node and access it through SSH port forwarding. The server itself uses only the Python 3 standard library.
 
 ![slurmboard screenshot](assets/screenshot.png)
 
@@ -45,14 +45,28 @@ No `pip install` needed — pure Python stdlib.
 ## Usage
 
 ```bash
-# default: bind 0.0.0.0:8000
+# default: bind an available port above 9000
 ./slurmboard.py
 
 # custom port / bind address
-./slurmboard.py --port 9000 --host 127.0.0.1
+./slurmboard.py --port 9100 --host 127.0.0.1
 ```
 
-Open `http://<login-node>:8000` in your browser. Use the ↻ buttons to refresh data without a full page reload.
+When no port is specified, slurmboard first tries port 9001. If it is occupied, the server probes up to 99 additional, non-sequential ports above 9000 using jittered exponential backoff. It prints a forwarding command using the selected port, for example:
+
+```text
+On your local machine, run this SSH forwarding command:
+
+  ssh -N -L 9001:127.0.0.1:9001 user@login.example.org
+```
+
+Run the printed command in a terminal on your local computer. If you normally connect through an alias from `~/.ssh/config`, replace `user@login.example.org` with that alias:
+
+```bash
+ssh -N -L 9001:127.0.0.1:9001 my-cluster
+```
+
+Keep that terminal open, then open `http://127.0.0.1:9001` in your local browser. Use the ↻ buttons to refresh data without a full page reload.
 
 ## How it works
 
