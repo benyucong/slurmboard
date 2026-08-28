@@ -307,9 +307,44 @@ Filesystem   group                  space   quota   limit   grace   files   quot
         self.assertEqual(len(rows), 4)
         self.assertEqual(rows[0]["scope"], "User")
         self.assertIsNone(rows[0]["files_limit"])
+        self.assertEqual(rows[0]["files_limit_label"], "unlimited")
         self.assertEqual(rows[1]["files_limit"], 1000000)
         self.assertEqual(rows[2]["scope"], "Group: domain users")
         self.assertEqual(rows[3]["space_limit_label"], "20T")
+
+    def test_parses_roihu_plain_quota_blocks_as_kib(self):
+        output = """
+Disk quotas for user yuc10 (uid 12345):
+     Filesystem  blocks     quota     limit   grace   files   quota   limit   grace
+      /dev/vdb1     164  83886080  83886080              14       0       0
+"""
+
+        rows = SLURMBOARD.parse_posix_quota(output)
+
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["path"], "/dev/vdb1")
+        self.assertEqual(rows[0]["space_used_label"], "164K")
+        self.assertEqual(rows[0]["space_limit_label"], "80G")
+        self.assertEqual(rows[0]["space_used"], 164 * 1024)
+        self.assertEqual(rows[0]["space_limit"], 80 * 1024 ** 3)
+        self.assertEqual(rows[0]["files_used_label"], "14")
+        self.assertEqual(rows[0]["files_limit_label"], "unlimited")
+
+    def test_standard_quota_prefers_human_readable_with_plain_fallback(self):
+        availability = lambda command: (
+            f"/usr/bin/{command}" if command == "quota" else None
+        )
+        with mock.patch.object(
+            SLURMBOARD, "_QUOTA_COMMAND", None
+        ), mock.patch.object(
+            SLURMBOARD.shutil, "which", side_effect=availability
+        ):
+            candidates = SLURMBOARD._quota_candidates()
+
+        self.assertEqual(candidates, [
+            ("quota", ["quota", "-s"]),
+            ("quota", ["quota"]),
+        ])
 
     def test_parses_gpfs_space_and_file_quotas(self):
         output = """
