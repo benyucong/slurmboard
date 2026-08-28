@@ -800,8 +800,8 @@ PAGE_TEMPLATE = """<!DOCTYPE html>
                align-items: center; justify-content: center; padding: 28px;
                background: rgba(0,0,0,.55); backdrop-filter: blur(2px); }
   .job-modal.open { display: flex; }
-  .job-dialog { width: min(760px, 100%); max-height: min(820px, calc(100vh - 56px));
-                overflow: auto; background: var(--bg); border: 1px solid var(--border);
+  .job-dialog { width: min(960px, 100%); max-height: min(820px, calc(100vh - 56px));
+                overflow-x: hidden; overflow-y: auto; background: var(--bg); border: 1px solid var(--border);
                 border-radius: 14px; box-shadow: 0 24px 80px rgba(0,0,0,.45); }
   .job-dialog-head { position: sticky; top: 0; z-index: 1; display: flex;
                      align-items: center; gap: 10px; padding: 16px 18px;
@@ -831,6 +831,8 @@ PAGE_TEMPLATE = """<!DOCTYPE html>
   .job-card table { border: 0; border-radius: 0; font-size: 13px; }
   .job-card td { padding: 5px 0; white-space: normal; vertical-align: top; }
   .job-card td:first-child { width: 105px; color: var(--muted); padding-right: 12px; white-space: nowrap; }
+  .job-card td:last-child { min-width: 0; overflow-wrap: anywhere; word-break: break-word; }
+  .job-card code { white-space: normal; overflow-wrap: anywhere; word-break: break-word; }
   .job-reason { color: var(--warn); background: rgba(240,169,63,.1);
                 border: 1px solid rgba(240,169,63,.3); border-radius: 6px;
                 padding: 8px 12px; margin-bottom: 14px; }
