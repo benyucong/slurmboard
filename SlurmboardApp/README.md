@@ -1,9 +1,9 @@
 # Slurmboard.app — macOS client
 
-Slurmboard.app is a native macOS shell for Slurmboard. Hosts, tabs, SFTP, and
-terminal sessions use the existing SwiftUI app, while each cluster dashboard is
-the bundled Python Slurmboard page displayed in a `WKWebView` through an SSH
-tunnel.
+Slurmboard.app is a native macOS shell for monitoring Slurm clusters and
+standalone Linux servers. Hosts, tabs, SFTP, and terminal sessions use the
+SwiftUI app, while each dashboard is the bundled Python page displayed in a
+`WKWebView` through an SSH tunnel.
 
 The app maintains its own copy of [`slurmboard.py`](slurmboard.py). That file is
 packaged into the app at build time and is updated manually with the app source;
@@ -44,9 +44,15 @@ macOS app ── /usr/bin/ssh ── login node: python3 -
   arguments.
 - Host cards can be edited or removed; the add and edit screens share the same
   connection form.
-- Optional SSH passwords are stored in the user's macOS Keychain, not in
-  `hosts.json`, command arguments, logs, or the repository.
-- One tab per Slurm dashboard, rendered by the bundled web UI.
+- Optional destination and ProxyJump passwords are stored separately in the
+  user's macOS Keychain, not in `hosts.json`, command arguments, logs, or the
+  repository.
+- Failed dashboard connections show a password field so password-only hosts
+  can be retried immediately, with optional Keychain saving.
+- One monitor tab per host, rendered by the bundled web UI.
+- Automatic mode selection: Slurm hosts show partitions, nodes, jobs, and
+  quotas; non-Slurm servers show CPU, memory, load, disks, NVIDIA GPU/VRAM, GPU
+  processes, and the connected user's top processes.
 - Native terminal and SFTP tabs.
 - Dashboard lists initially render at most 100 rows and append more rows when
   scrolled to the bottom. There are no pagination or “load more” controls.
@@ -55,6 +61,8 @@ macOS app ── /usr/bin/ssh ── login node: python3 -
   request-driven and incrementally rendered.
 - Storage quota discovery is optional. If the cluster has no supported quota
   command, the Storage Quota section is hidden.
+- BSC systems are detected through `bsc_quota`, including user/group GPFS
+  space usage and file counts even when the standard `quota` command fails.
 
 ## Requirements
 
@@ -71,13 +79,14 @@ xcode-select --install
 swift --version
 ```
 
-### Remote cluster
+### Remote host
 
-- SSH access to a Slurm login or submit node.
+- SSH access to a Slurm login node or standalone Linux server.
 - Python 3.7 or later available as `python3` or `python3.7`–`python3.13`.
-- `sinfo`, `scontrol`, and `squeue` available in `PATH`.
-- `sacct` is required for job history.
-- Quota commands are optional.
+- For Slurm mode, `sinfo`, `scontrol`, and `squeue` must be available in `PATH`;
+  `sacct` is required for job history and quota commands are optional.
+- For standalone server mode, Linux `/proc`, `df`, and `ps` provide system data;
+  `nvidia-smi` is optional and enables NVIDIA GPU data.
 
 The remote account does not need Slurmboard installed. The app streams its
 bundled source for every dashboard connection.
@@ -95,7 +104,8 @@ open Slurmboard.app
 ```
 
 `build_app.sh` performs a Swift release build, assembles
-`Slurmboard.app/Contents`, embeds `slurmboard.py`, and applies an ad-hoc local
+`Slurmboard.app/Contents`, generates the `.icns` icon set from
+`Resources/AppIcon.png`, embeds `slurmboard.py`, and applies an ad-hoc local
 signature.
 
 For a faster development build:
@@ -133,7 +143,15 @@ Alternatively, click **Add Host** and choose one of these input methods:
   `ProxyJump`, extra arguments, and optional password separately.
 
 When editing a host, leaving the password field empty preserves the saved
-Keychain password. Use the clear-password control to delete it.
+Keychain password. Password entry is available for both complete SSH commands
+and connection-field hosts. Use the clear-password control to delete it.
+
+If a dashboard connection fails because SSH needs a password, enter the
+destination password, the jump-host password, or both directly on the
+connection screen and click **Connect with Password**. Leave **Save entered
+passwords in macOS Keychain** enabled to reuse them for later connections. The
+askpass helper matches the jump hostname in OpenSSH's prompt so a ProxyJump
+password is not sent in response to a destination-host password prompt.
 
 Before connecting for the first time, accept the remote host key in Terminal if
 your SSH policy does not allow an interactive host-key prompt inside the app:
@@ -160,6 +178,8 @@ SlurmboardApp/
   Package.swift
   Info.plist
   build_app.sh
+  Resources/AppIcon.png        1024 px application icon source
+  scripts/make_icns.py          fallback ICNS packer for affected macOS toolchains
   slurmboard.py                 embedded dashboard backend and web UI
   Sources/SlurmboardApp/
     SlurmboardApp.swift
@@ -198,9 +218,10 @@ First test the same host with the system SSH client:
 ssh <host-alias>
 ```
 
-Then verify `python3`, `sinfo`, `scontrol`, and `squeue` are available on the
-login node. SSH options from the saved host, including identity files and
-`ProxyJump`, are passed to `/usr/bin/ssh`.
+Then verify `python3` is available. For a Slurm dashboard, also verify `sinfo`,
+`scontrol`, and `squeue` are in `PATH`. A standalone server does not need those
+commands or internet access. SSH options from the saved host, including
+identity files and `ProxyJump`, are passed to `/usr/bin/ssh`.
 
 ### Storage Quota is absent
 

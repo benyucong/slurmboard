@@ -37,12 +37,15 @@ struct HostPickerView: View {
             }
         }
         .sheet(isPresented: $showingAdd) {
-            HostEditorSheet { host, password, _ in manager.addHost(host, password: password) }
+            HostEditorSheet { host, password, _, jumpPassword, _ in
+                manager.addHost(host, password: password, jumpPassword: jumpPassword)
+            }
         }
         .sheet(item: $editingHost) { host in
-            HostEditorSheet(host: host) { updated, password, clearPassword in
+            HostEditorSheet(host: host) { updated, password, clearPassword, jumpPassword, clearJumpPassword in
                 manager.updateHost(updated, replacing: host.id,
-                                   password: password, clearPassword: clearPassword)
+                                   password: password, clearPassword: clearPassword,
+                                   jumpPassword: jumpPassword, clearJumpPassword: clearJumpPassword)
             }
         }
         .sheet(isPresented: $showingImport) {
@@ -99,7 +102,7 @@ struct HostPickerView: View {
             Divider()
             HStack(spacing: 8) {
                 Button { _ = manager.connect(host: host) } label: {
-                    Label("SlurmBoard", systemImage: "chart.bar")
+                    Label("Monitor", systemImage: "chart.bar")
                         .frame(maxWidth: .infinity)
                 }.buttonStyle(.borderedProminent)
                 Button { manager.openTerminal(host: host) } label: {
@@ -140,12 +143,17 @@ private struct HostEditorSheet: View {
     @State private var extraArguments: String
     @State private var password = ""
     @State private var clearPassword = false
+    @State private var jumpPassword = ""
+    @State private var clearJumpPassword = false
     private let hadSavedPassword: Bool
-    let onSave: (SSHHost, String?, Bool) -> Void
+    private let hadSavedJumpPassword: Bool
+    let onSave: (SSHHost, String?, Bool, String?, Bool) -> Void
 
-    init(host: SSHHost? = nil, onSave: @escaping (SSHHost, String?, Bool) -> Void) {
+    init(host: SSHHost? = nil,
+         onSave: @escaping (SSHHost, String?, Bool, String?, Bool) -> Void) {
         self.editing = host != nil
         self.hadSavedPassword = host.map { CredentialStore.password(for: $0.id) != nil } ?? false
+        self.hadSavedJumpPassword = host.map { CredentialStore.jumpPassword(for: $0.id) != nil } ?? false
         self.onSave = onSave
         let inferred = Self.inferFields(from: host)
         _mode = State(initialValue: host?.sshCommand == nil && host != nil ? .fields : .command)
@@ -198,6 +206,13 @@ private struct HostEditorSheet: View {
                 .font(.system(.body, design: .monospaced))
             Text("Paste the same command you use in Terminal. Options such as -p, -i, -J and -o are preserved.")
                 .font(.caption).foregroundStyle(.secondary)
+            Divider()
+            Label("Destination password", systemImage: "key").font(.headline)
+            passwordControls
+            Divider()
+            Label("Jump-host password", systemImage: "point.3.connected.trianglepath.dotted")
+                .font(.headline)
+            jumpPasswordControls
         }
     }
 
@@ -211,7 +226,22 @@ private struct HostEditorSheet: View {
                 TextField("Username", text: $username)
                 TextField("Port", text: $port).frame(width: 90)
             }
-            SecureField(hadSavedPassword ? "New password (leave blank to keep saved password)" : "Password (optional)",
+            passwordControls
+            TextField("Identity file, e.g. ~/.ssh/id_ed25519", text: $identityFile)
+            Divider()
+            Label("Connection options", systemImage: "point.3.connected.trianglepath.dotted").font(.headline)
+            TextField("ProxyJump, e.g. user@jump.example.org", text: $proxyJump)
+            jumpPasswordControls
+            TextField("Extra SSH arguments, e.g. -o ServerAliveInterval=30", text: $extraArguments)
+                .font(.system(.body, design: .monospaced))
+            Text("Passwords are stored in macOS Keychain and never written to hosts.json or command arguments.")
+                .font(.caption).foregroundStyle(.secondary)
+        }
+    }
+
+    private var passwordControls: some View {
+        Group {
+            SecureField(hadSavedPassword ? "New destination password (blank keeps saved password)" : "Destination password (optional)",
                         text: $password)
                 .onChange(of: password) { if !password.isEmpty { clearPassword = false } }
             if hadSavedPassword {
@@ -226,15 +256,46 @@ private struct HostEditorSheet: View {
                     }.buttonStyle(.link)
                 }
             }
-            TextField("Identity file, e.g. ~/.ssh/id_ed25519", text: $identityFile)
-            Divider()
-            Label("Connection options", systemImage: "point.3.connected.trianglepath.dotted").font(.headline)
-            TextField("ProxyJump, e.g. user@jump.example.org", text: $proxyJump)
-            TextField("Extra SSH arguments, e.g. -o ServerAliveInterval=30", text: $extraArguments)
-                .font(.system(.body, design: .monospaced))
-            Text("Passwords are stored in macOS Keychain and never written to hosts.json or command arguments.")
+            Text("Stored in macOS Keychain; never written to hosts.json or command arguments.")
                 .font(.caption).foregroundStyle(.secondary)
         }
+    }
+
+    private var jumpPasswordControls: some View {
+        Group {
+            SecureField(jumpPasswordPlaceholder, text: $jumpPassword)
+                .onChange(of: jumpPassword) { if !jumpPassword.isEmpty { clearJumpPassword = false } }
+            if hadSavedJumpPassword {
+                HStack {
+                    Label(clearJumpPassword ? "Saved jump password will be removed" : "A jump-host password is saved in Keychain",
+                          systemImage: clearJumpPassword ? "trash" : "checkmark.shield")
+                        .font(.caption).foregroundStyle(clearJumpPassword ? Color.red : Color.secondary)
+                    Spacer()
+                    Button(clearJumpPassword ? "Keep Password" : "Clear Password") {
+                        clearJumpPassword.toggle()
+                        if clearJumpPassword { jumpPassword = "" }
+                    }.buttonStyle(.link)
+                }
+            }
+            Text(jumpHostName.map { "Used only when SSH asks for the password to \($0)." }
+                 ?? "Used for the first host in -J or ProxyJump.")
+                .font(.caption).foregroundStyle(.secondary)
+        }
+    }
+
+    private var jumpHostName: String? {
+        if mode == .fields, !proxyJump.trimmed.isEmpty {
+            return SSHHost(alias: trimmedName, hostName: nil, proxyJump: proxyJump.trimmed).effectiveProxyJump
+        }
+        guard mode == .command, !trimmedCommand.isEmpty else { return nil }
+        return SSHHost(alias: trimmedName, hostName: nil, proxyJump: nil,
+                       sshCommand: trimmedCommand).effectiveProxyJump
+    }
+
+    private var jumpPasswordPlaceholder: String {
+        if hadSavedJumpPassword { return "New jump-host password (blank keeps saved password)" }
+        if let jumpHostName { return "Password for \(jumpHostName) (optional)" }
+        return "Jump-host password (optional)"
     }
 
     private func save() {
@@ -255,7 +316,8 @@ private struct HostEditorSheet: View {
                            hostName: mode == .fields ? trimmedAddress : nil,
                            proxyJump: mode == .fields && !proxyJump.trimmed.isEmpty ? proxyJump.trimmed : nil,
                            sshCommand: sshCommand)
-        onSave(host, password.isEmpty ? nil : password, clearPassword)
+        onSave(host, password.isEmpty ? nil : password, clearPassword,
+               jumpPassword.isEmpty ? nil : jumpPassword, clearJumpPassword)
         dismiss()
     }
 

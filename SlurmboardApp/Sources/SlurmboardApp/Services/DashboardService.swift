@@ -7,7 +7,8 @@ import Combine
 final class DashboardService: ObservableObject {
     let id = UUID()
     let host: SSHHost
-    private let password: String?
+    private var password: String?
+    private var jumpPassword: String?
 
     @Published private(set) var state: ConnectionState = .connecting
     @Published private(set) var dashboardURL: URL?
@@ -16,9 +17,10 @@ final class DashboardService: ObservableObject {
     private var connectTask: Task<Void, Never>?
     private var authDirectory: URL?
 
-    init(host: SSHHost, password: String?) {
+    init(host: SSHHost, password: String?, jumpPassword: String?) {
         self.host = host
         self.password = password
+        self.jumpPassword = jumpPassword
     }
 
     func connect() {
@@ -27,7 +29,15 @@ final class DashboardService: ObservableObject {
         connectTask = Task { await startTunnel() }
     }
 
-    func retry() { connect() }
+    func retry(password: String? = nil, jumpPassword: String? = nil) {
+        if let password, !password.isEmpty {
+            self.password = password
+        }
+        if let jumpPassword, !jumpPassword.isEmpty {
+            self.jumpPassword = jumpPassword
+        }
+        connect()
+    }
 
     func disconnect() {
         connectTask?.cancel()
@@ -48,18 +58,23 @@ final class DashboardService: ObservableObject {
 
             let process = Process()
             process.executableURL = URL(fileURLWithPath: "/usr/bin/ssh")
+            let hasPassword = password?.isEmpty == false || jumpPassword?.isEmpty == false
             var arguments = [
                 "-T",
-                "-o", "BatchMode=\(password == nil ? "yes" : "no")",
+                "-o", "BatchMode=\(hasPassword ? "no" : "yes")",
                 "-o", "ExitOnForwardFailure=yes",
                 "-o", "ConnectTimeout=15",
                 "-o", "ServerAliveInterval=30",
                 "-o", "ServerAliveCountMax=3",
                 "-L", "127.0.0.1:\(localPort):127.0.0.1:\(remotePort)",
             ]
-            if password != nil { arguments += ["-o", "NumberOfPasswordPrompts=1"] }
+            if hasPassword { arguments += ["-o", "NumberOfPasswordPrompts=1"] }
             process.arguments = arguments + host.connectionArguments + [remoteCommand]
-            if let password { process.environment = try prepareAskPass(password: password) }
+            if hasPassword {
+                process.environment = try prepareAskPass(password: password,
+                                                         jumpPassword: jumpPassword,
+                                                         jumpHostHint: host.proxyJumpPromptHint)
+            }
 
             let input = Pipe()
             let errors = Pipe()
@@ -98,23 +113,57 @@ final class DashboardService: ObservableObject {
         }
     }
 
-    private func prepareAskPass(password: String) throws -> [String: String] {
+    private func prepareAskPass(password: String?, jumpPassword: String?,
+                                jumpHostHint: String?) throws -> [String: String] {
         let directory = FileManager.default.temporaryDirectory
             .appendingPathComponent("slurmboard-askpass-\(UUID().uuidString)", isDirectory: true)
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: false)
-        let passwordFile = directory.appendingPathComponent("password")
-        let helperFile = directory.appendingPathComponent("askpass")
-        try Data(password.utf8).write(to: passwordFile, options: .atomic)
-        try Data("#!/bin/sh\nexec /bin/cat \"$SLURMBOARD_ASKPASS_FILE\"\n".utf8)
-            .write(to: helperFile, options: .atomic)
-        try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: passwordFile.path)
-        try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: helperFile.path)
         authDirectory = directory
+        let helperFile = directory.appendingPathComponent("askpass")
+
+        func writeSecret(_ value: String, name: String) throws -> URL {
+            let file = directory.appendingPathComponent(name)
+            try Data(value.utf8).write(to: file, options: .atomic)
+            try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: file.path)
+            return file
+        }
+
+        let passwordFile = try password.map { try writeSecret($0, name: "destination-password") }
+        let jumpPasswordFile = try jumpPassword.map { try writeSecret($0, name: "jump-password") }
+        let helper = """
+        #!/bin/sh
+        prompt="${1:-}"
+        if [ -n "${SLURMBOARD_JUMP_ASKPASS_FILE:-}" ]; then
+          if [ -n "${SLURMBOARD_JUMP_HOST_HINT:-}" ] && \
+             /usr/bin/printf '%s' "$prompt" | /usr/bin/grep -Fqi -- "$SLURMBOARD_JUMP_HOST_HINT"; then
+            exec /bin/cat "$SLURMBOARD_JUMP_ASKPASS_FILE"
+          fi
+          if [ -z "${SLURMBOARD_JUMP_HOST_HINT:-}" ] && \
+             [ -z "${SLURMBOARD_DESTINATION_ASKPASS_FILE:-}" ]; then
+            exec /bin/cat "$SLURMBOARD_JUMP_ASKPASS_FILE"
+          fi
+        fi
+        if [ -n "${SLURMBOARD_DESTINATION_ASKPASS_FILE:-}" ]; then
+          exec /bin/cat "$SLURMBOARD_DESTINATION_ASKPASS_FILE"
+        fi
+        exit 1
+        """
+        try Data(helper.utf8)
+            .write(to: helperFile, options: .atomic)
+        try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: helperFile.path)
         var environment = ProcessInfo.processInfo.environment
         environment["SSH_ASKPASS"] = helperFile.path
         environment["SSH_ASKPASS_REQUIRE"] = "force"
         environment["DISPLAY"] = environment["DISPLAY"] ?? ":0"
-        environment["SLURMBOARD_ASKPASS_FILE"] = passwordFile.path
+        if let passwordFile {
+            environment["SLURMBOARD_DESTINATION_ASKPASS_FILE"] = passwordFile.path
+        }
+        if let jumpPasswordFile {
+            environment["SLURMBOARD_JUMP_ASKPASS_FILE"] = jumpPasswordFile.path
+        }
+        if let jumpHostHint, !jumpHostHint.isEmpty {
+            environment["SLURMBOARD_JUMP_HOST_HINT"] = jumpHostHint
+        }
         return environment
     }
 

@@ -1,8 +1,10 @@
 # slurmboard
 
-A lightweight, dependency-free web dashboard for Slurm clusters.
+A lightweight, dependency-free web dashboard for Slurm clusters and standalone
+Linux servers.
 
-Run it directly on a Slurm login node, or launch it from your Mac through an SSH tunnel — no extra packages, just Python 3 stdlib.
+Run it directly on a remote machine, or launch it from your Mac through an SSH
+tunnel — no extra packages, just Python 3 stdlib.
 
 ![slurmboard screenshot](assets/screenshot.png)
 
@@ -21,6 +23,9 @@ Run it directly on a Slurm login node, or launch it from your Mac through an SSH
 - **My Jobs panel** — seven-day Slurm accounting history; sortable by state / ID / time / date; shows submit time
 - **All progress bars show idle ratio** — green bar = available resources
 - **Storage quota panel** — on-demand disk-space and file-count usage across POSIX/NFS, Lustre, GPFS, BeeGFS, and site-specific HPC tools
+- **Standalone server mode** — automatically used when Slurm is absent; shows
+  CPU, memory, load, mounted-storage usage, NVIDIA GPU/VRAM/temperature/power,
+  GPU processes, and the connected user's top processes
 
 ## Installation
 
@@ -60,7 +65,10 @@ requirements, host authentication, security, and troubleshooting details.
 ## Requirements
 
 - Python ≥ 3.7 (stdlib only — no pip installs)
-- Running on a node with `sinfo`, `scontrol`, `squeue` in `$PATH` (Slurm login or submit node)
+- SSH access to the remote machine
+- `sinfo`, `scontrol`, and `squeue` in `$PATH` for the Slurm cluster view
+- Linux `/proc`, `df`, and `ps` for the standalone server view; `nvidia-smi` is
+  optional and enables NVIDIA GPU details
 
 ## Usage
 
@@ -96,6 +104,8 @@ The launcher does all of the following for you:
 - starts the remote dashboard on loopback and creates the local tunnel
 - lets you pin frequently used hosts to the top; pins persist between launcher runs
 - stops the remote dashboard and tunnel when you click **Stop** or quit the launcher with `Ctrl+C`
+- automatically opens the Slurm dashboard when Slurm tools are present, or the
+  general server dashboard when they are not
 
 The launcher uses keys, agents, `ProxyJump`, and other options from your SSH
 configuration; password-only hosts can use the session-cached field described
@@ -111,7 +121,7 @@ Wildcard-only entries such as `Host *` are not shown because they are SSH defaul
 
 The dashboard refreshes its compact cluster summary every minute by default. Use the **Auto refresh** menu to choose manual refresh, 15 or 30 seconds, or 1, 2, or 5 minutes. The choice is remembered across launcher ports. Automatic refresh skips hidden browser tabs. Roihu-sized clusters load partition counts and personal jobs automatically; larger clusters keep those panels click-to-load, and later history refreshes remain manual.
 
-Storage quota discovery supports standard `quota`, Lustre `lfs quota`, IBM Storage Scale/GPFS `mmlsquota`, BeeGFS 7 and 8, LUMI tools, and common site wrappers. If a cluster provides another read-only command, pass it explicitly; the launcher forwards it safely to the remote dashboard without using a shell:
+Storage quota discovery supports standard `quota`, Lustre `lfs quota`, IBM Storage Scale/GPFS `mmlsquota`, BeeGFS 7 and 8, LUMI tools, BSC's `bsc_quota`, and common site wrappers. If a cluster provides another read-only command, pass it explicitly; the launcher forwards it safely to the remote dashboard without using a shell:
 
 ```bash
 ./slurmboard.py --launcher --quota-command "site-quota --human-readable"
@@ -127,6 +137,9 @@ Recognized output is displayed as usage bars. Unrecognized output is still shown
 
 # custom port / bind address
 ./slurmboard.py --port 9100 --host 127.0.0.1
+
+# explicitly monitor a standalone, non-Slurm Linux server
+./slurmboard.py --mode server --port 9100 --host 127.0.0.1
 ```
 
 When no port is specified, slurmboard first tries port 9001. If it is occupied, the server probes up to 99 additional, non-sequential ports above 9000 using jittered exponential backoff. It prints a forwarding command using the selected port, for example:
@@ -176,6 +189,13 @@ quota / filesystem tools     # storage and file quotas, only when requested
 Results are cached to absorb repeated clicks and concurrent Slurm requests are serialized to avoid bursts against the controller. Storage quotas are cached for five minutes and loaded only when you click their refresh button. The frontend is vanilla JS — no framework or build step. Only the compact cluster summary polls at the selected automatic-refresh interval (one minute by default). On smaller clusters its cached partition job counts and an already-open active queue refresh with it; exact node details, quotas, and later history refreshes remain request-driven.
 
 Job history is read from Slurm accounting (`sacct`) for the last seven days.
+
+On a standalone server, the dashboard instead reads Linux `/proc`, `df`, the
+current user's `ps` table, and (when available) `nvidia-smi`. Process command
+arguments are never collected. These commands execute on the remote machine,
+so the server does not need internet access. General-server snapshots are
+cached briefly and can be refreshed manually or every 5, 10, 15, 30, or 60
+seconds from the dashboard.
 
 ## Typical workflow
 
