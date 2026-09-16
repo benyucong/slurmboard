@@ -1,5 +1,6 @@
 import SwiftUI
 import WebKit
+import AppKit
 
 struct ClusterWindowView: View {
     @EnvironmentObject private var manager: ConnectionManager
@@ -36,14 +37,13 @@ private struct DashboardWorkspace: View {
                 switch service.state {
                 case .connecting:
                     statusView(title: "Connecting…",
-                               detail: "Starting the remote dashboard on \(service.host.alias)…",
-                               error: false)
+                               detail: "Starting the remote dashboard on \(service.host.alias)…")
                 case .failed(let message):
                     failedConnectionView(message: message)
                 case .disconnected:
-                    statusView(title: "Disconnected", detail: nil, error: false)
+                    statusView(title: "Disconnected", detail: nil)
                 case .connected:
-                    statusView(title: "Loading dashboard…", detail: nil, error: false)
+                    statusView(title: "Loading dashboard…", detail: nil)
                 }
             }
         }
@@ -54,9 +54,21 @@ private struct DashboardWorkspace: View {
             Image(systemName: "exclamationmark.triangle.fill")
                 .font(.largeTitle).foregroundStyle(.red)
             Text("Connection failed").font(.headline)
-            Text(message).font(.callout).foregroundStyle(.secondary)
-                .multilineTextAlignment(.center).textSelection(.enabled)
-                .frame(maxWidth: 620)
+            Text("Host: \(service.host.alias)")
+                .font(.subheadline.weight(.medium))
+            ScrollView {
+                Text(message)
+                    .font(.system(.callout, design: .monospaced))
+                    .foregroundStyle(.secondary)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .textSelection(.enabled)
+            }
+            .frame(maxWidth: 680, maxHeight: 180)
+            .padding(12)
+            .background(Color.secondary.opacity(0.08), in: RoundedRectangle(cornerRadius: 8))
+            Text("Check the SSH host or alias, network/VPN, credentials, and ~/.ssh/config, then retry.")
+                .font(.footnote).foregroundStyle(.secondary)
+                .multilineTextAlignment(.center)
 
             VStack(alignment: .leading, spacing: 10) {
                 Text("SSH credentials").font(.subheadline.weight(.semibold))
@@ -86,6 +98,10 @@ private struct DashboardWorkspace: View {
                 Button("Connect with Password") { connectWithPassword() }
                     .buttonStyle(.borderedProminent)
                     .disabled(password.isEmpty && jumpPassword.isEmpty)
+                Button("Copy Error") {
+                    NSPasteboard.general.clearContents()
+                    NSPasteboard.general.setString(message, forType: .string)
+                }
             }
         }
         .padding(32).frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -103,21 +119,16 @@ private struct DashboardWorkspace: View {
                                 rememberPassword: rememberPassword)
     }
 
-    private func statusView(title: String, detail: String?, error: Bool) -> some View {
-        VStack(spacing: 12) {
-            if error {
-                Image(systemName: "exclamationmark.triangle.fill")
-                    .font(.largeTitle).foregroundStyle(.red)
-            } else {
-                ProgressView()
-            }
+    private func statusView(title: String, detail: String?) -> some View {
+        VStack(spacing: 14) {
+            ProgressView()
             Text(title).font(.headline)
             if let detail {
                 Text(detail).font(.callout).foregroundStyle(.secondary)
                     .multilineTextAlignment(.center).textSelection(.enabled)
             }
-            if error || service.state == .disconnected {
-                Button("Retry") { service.retry() }.buttonStyle(.borderedProminent)
+            if service.state == .disconnected {
+                Button("Retry") { manager.retryConnection(service.id) }.buttonStyle(.borderedProminent)
             }
         }
         .padding(32).frame(maxWidth: .infinity, maxHeight: .infinity)

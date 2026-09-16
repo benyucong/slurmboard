@@ -53,7 +53,7 @@ macOS app ── /usr/bin/ssh ── login node: python3 -
 - Automatic mode selection: Slurm hosts show partitions, nodes, jobs, and
   quotas; non-Slurm servers show CPU, memory, load, disks, NVIDIA GPU/VRAM, GPU
   processes, and the connected user's top processes.
-- Native terminal and SFTP tabs.
+- An embedded SwiftTerm terminal and native SFTP tabs.
 - Dashboard lists initially render at most 100 rows and append more rows when
   scrolled to the bottom. There are no pagination or “load more” controls.
 - Partition job counts, GPU allocation summaries, Active Queue, and seven-day
@@ -69,14 +69,16 @@ macOS app ── /usr/bin/ssh ── login node: python3 -
 ### Local Mac
 
 - macOS 14 or later.
-- Xcode Command Line Tools or Xcode with Swift 5.9 or later.
+- Xcode with Swift 5.9 or later and the Metal compiler tools for SwiftTerm's
+  shaders. Command Line Tools alone may not include the required `metal` compiler.
 - System OpenSSH (`/usr/bin/ssh`, included with macOS).
 
-Install the command-line developer tools if needed:
+Check the selected developer tools:
 
 ```bash
-xcode-select --install
+xcode-select -p
 swift --version
+xcrun --find metal
 ```
 
 ### Remote host
@@ -93,11 +95,10 @@ bundled source for every dashboard connection.
 
 ## Build from source
 
-Clone the macOS app branch and build a release app bundle:
+Clone the repository and build a release app bundle:
 
 ```bash
-git clone -b feature/macos-native-app \
-  https://github.com/zhangdoudou/slurmboard.git
+git clone https://github.com/zhangdoudou/slurmboard.git
 cd slurmboard/SlurmboardApp
 ./build_app.sh --release
 open Slurmboard.app
@@ -105,8 +106,10 @@ open Slurmboard.app
 
 `build_app.sh` performs a Swift release build, assembles
 `Slurmboard.app/Contents`, generates the `.icns` icon set from
-`Resources/AppIcon.png`, embeds `slurmboard.py`, and applies an ad-hoc local
-signature.
+`Resources/AppIcon.png`, embeds `slurmboard.py` and Swift package resource
+bundles, and applies an ad-hoc local signature. Swift package dependencies
+require internet access on the Mac during the first build; monitoring does
+not require internet access on the remote host.
 
 For a faster development build:
 
@@ -199,6 +202,12 @@ Some earlier native dashboard models and views remain in the source tree, but
 the current Slurm dashboard path uses `DashboardService` and `WKWebView`.
 
 ## Troubleshooting
+
+### The build cannot find `metal`
+
+SwiftTerm includes Metal shaders. Select a full Xcode installation with its
+Metal compiler tools, then check that `xcrun --find metal` succeeds before
+rebuilding. Installing Command Line Tools alone may not be sufficient.
 
 ### `swift build` reports an SDK/compiler mismatch
 

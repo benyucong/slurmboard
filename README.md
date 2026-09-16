@@ -45,15 +45,14 @@ No `pip install` needed — pure Python stdlib.
 
 ## macOS app
 
-The `feature/macos-native-app` branch also contains a native macOS shell with
+The repository also contains a native macOS shell with
 host cards, terminal and SFTP tabs, and the Slurmboard dashboard embedded in a
 `WKWebView` over an automatically managed SSH tunnel.
 
-Build it locally with Xcode Command Line Tools or Xcode:
+Build it locally with Xcode and its Metal compiler tools:
 
 ```bash
-git clone -b feature/macos-native-app \
-  https://github.com/zhangdoudou/slurmboard.git
+git clone https://github.com/zhangdoudou/slurmboard.git
 cd slurmboard/SlurmboardApp
 ./build_app.sh --release
 open Slurmboard.app
@@ -205,9 +204,15 @@ seconds from the dashboard.
 4. Click a partition row to expand its nodes and pick the least loaded one.
 5. Monitor your submitted jobs in the **My Jobs** panel on the right.
 
-## Inspiration
+## Acknowledgements
 
-Motivated by [slurmmanager](https://github.com/paulgavrikov/slurmmanager); built to run without SSH access to compute nodes.
+Slurmboard was motivated by
+[slurmmanager](https://github.com/paulgavrikov/slurmmanager) and was designed to
+run without SSH access to compute nodes.
+
+The native macOS app uses [SwiftTerm](https://github.com/migueldeicaza/SwiftTerm),
+an MIT-licensed VT100/xterm terminal emulator for Swift, to provide its embedded
+PTY-backed SSH terminal.
 
 ## License
 

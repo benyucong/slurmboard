@@ -307,9 +307,44 @@ Filesystem   group                  space   quota   limit   grace   files   quot
         self.assertEqual(len(rows), 4)
         self.assertEqual(rows[0]["scope"], "User")
         self.assertIsNone(rows[0]["files_limit"])
+        self.assertEqual(rows[0]["files_limit_label"], "unlimited")
         self.assertEqual(rows[1]["files_limit"], 1000000)
         self.assertEqual(rows[2]["scope"], "Group: domain users")
         self.assertEqual(rows[3]["space_limit_label"], "20T")
+
+    def test_parses_roihu_plain_quota_blocks_as_kib(self):
+        output = """
+Disk quotas for user yuc10 (uid 12345):
+     Filesystem  blocks     quota     limit   grace   files   quota   limit   grace
+      /dev/vdb1     164  83886080  83886080              14       0       0
+"""
+
+        rows = SLURMBOARD.parse_posix_quota(output)
+
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["path"], "/dev/vdb1")
+        self.assertEqual(rows[0]["space_used_label"], "164K")
+        self.assertEqual(rows[0]["space_limit_label"], "80G")
+        self.assertEqual(rows[0]["space_used"], 164 * 1024)
+        self.assertEqual(rows[0]["space_limit"], 80 * 1024 ** 3)
+        self.assertEqual(rows[0]["files_used_label"], "14")
+        self.assertEqual(rows[0]["files_limit_label"], "unlimited")
+
+    def test_standard_quota_prefers_human_readable_with_plain_fallback(self):
+        availability = lambda command: (
+            f"/usr/bin/{command}" if command == "quota" else None
+        )
+        with mock.patch.object(
+            SLURMBOARD, "_QUOTA_COMMAND", None
+        ), mock.patch.object(
+            SLURMBOARD.shutil, "which", side_effect=availability
+        ):
+            candidates = SLURMBOARD._quota_candidates()
+
+        self.assertEqual(candidates, [
+            ("quota", ["quota", "-s"]),
+            ("quota", ["quota"]),
+        ])
 
     def test_parses_gpfs_space_and_file_quotas(self):
         output = """
@@ -412,6 +447,74 @@ alice     | 1000  || 1024.00 MiB|1024.00 MiB|| 1     |unlimited
         run.assert_called_once_with(["site-quota", "--human", "readable"])
         self.assertEqual(result["source"], "custom")
         self.assertEqual(len(result["rows"]), 1)
+
+
+class JobPriorityTests(unittest.TestCase):
+    def setUp(self):
+        SLURMBOARD._CACHE.clear()
+
+    def tearDown(self):
+        SLURMBOARD._CACHE.clear()
+
+    def test_parses_cluster_priority_configuration(self):
+        config = SLURMBOARD._parse_priority_config("""
+PriorityType              = priority/multifactor
+PriorityWeightAge         = 500
+PriorityWeightFairshare   = 1000
+PriorityWeightTRES        = (null)
+SchedulerType             = sched/backfill
+""")
+
+        self.assertEqual(config, {
+            "PriorityType": "priority/multifactor",
+            "PriorityWeightAge": "500",
+            "PriorityWeightFairshare": "1000",
+            "PriorityWeightTRES": "(null)",
+        })
+
+    def test_parses_weighted_priority_formula_and_factors(self):
+        config = {
+            "PriorityWeightAge": "500",
+            "PriorityWeightFairshare": "1000",
+            "PriorityWeightJobSize": "1000",
+            "PriorityWeightPartition": "1000",
+            "PriorityWeightQOS": "100",
+        }
+        output = "123|2800|0|200|0|600|1000|1000|0|cpu=0,mem=0|0\n"
+
+        detail = SLURMBOARD._parse_sprio_priority(output, config)
+
+        self.assertTrue(detail["available"])
+        self.assertEqual(detail["total"], 2800)
+        self.assertEqual(detail["computed_total"], 2800)
+        self.assertEqual(detail["difference"], 0)
+        by_key = {factor["key"]: factor for factor in detail["factors"]}
+        self.assertEqual(by_key["age"]["factor"], 0.4)
+        self.assertEqual(by_key["fairshare"]["factor"], 0.6)
+        self.assertEqual(by_key["job_size"]["contribution"], "1000")
+
+    def test_accepts_legacy_sprio_without_association_field(self):
+        output = "123|2800|0|200|600|1000|1000|0|0|0\n"
+
+        detail = SLURMBOARD._parse_sprio_priority(output, {}, 2800)
+
+        association = next(
+            factor for factor in detail["factors"] if factor["key"] == "association"
+        )
+        self.assertEqual(association["contribution"], "0")
+        self.assertEqual(detail["computed_total"], 2800)
+
+    def test_unavailable_live_breakdown_keeps_recorded_total(self):
+        failure = SLURMBOARD.subprocess.CalledProcessError(1, ["sprio"])
+        with mock.patch.object(
+            SLURMBOARD, "_run",
+            side_effect=["PriorityType = priority/multifactor\n", failure, failure],
+        ):
+            detail = SLURMBOARD.collect_job_priority("123", "456")
+
+        self.assertFalse(detail["available"])
+        self.assertEqual(detail["total"], 456)
+        self.assertIn("completed jobs", detail["note"])
 
 
 if __name__ == "__main__":
