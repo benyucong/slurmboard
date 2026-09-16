@@ -68,7 +68,7 @@ private struct WorkspaceView: View {
                 workspaceTab("SFTP", tab: .sftp)
                 ForEach(manager.connectionIDs, id: \.self) { id in
                     if let service = manager.service(for: id) {
-                        workspaceTab("SlurmBoard · \(service.host.alias)", tab: .cluster(id))
+                        workspaceTab("Monitor · \(service.host.alias)", tab: .cluster(id))
                     }
                 }
                 ForEach(manager.terminalIDs, id: \.self) { id in

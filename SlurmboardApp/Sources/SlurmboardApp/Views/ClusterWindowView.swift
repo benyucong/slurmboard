@@ -23,7 +23,11 @@ struct ClusterWindowView: View {
 }
 
 private struct DashboardWorkspace: View {
+    @EnvironmentObject private var manager: ConnectionManager
     @ObservedObject var service: DashboardService
+    @State private var password = ""
+    @State private var jumpPassword = ""
+    @State private var rememberPassword = true
 
     var body: some View {
         ZStack {
@@ -33,62 +37,98 @@ private struct DashboardWorkspace: View {
                 switch service.state {
                 case .connecting:
                     statusView(title: "Connecting…",
-                               detail: "Starting the remote dashboard on \(service.host.alias)…",
-                               error: false)
+                               detail: "Starting the remote dashboard on \(service.host.alias)…")
                 case .failed(let message):
-                    statusView(title: "Connection failed", detail: message, error: true)
+                    failedConnectionView(message: message)
                 case .disconnected:
-                    statusView(title: "Disconnected", detail: nil, error: false)
+                    statusView(title: "Disconnected", detail: nil)
                 case .connected:
-                    statusView(title: "Loading dashboard…", detail: nil, error: false)
+                    statusView(title: "Loading dashboard…", detail: nil)
                 }
             }
         }
     }
 
-    private func statusView(title: String, detail: String?, error: Bool) -> some View {
+    private func failedConnectionView(message: String) -> some View {
+        VStack(spacing: 12) {
+            Image(systemName: "exclamationmark.triangle.fill")
+                .font(.largeTitle).foregroundStyle(.red)
+            Text("Connection failed").font(.headline)
+            Text("Host: \(service.host.alias)")
+                .font(.subheadline.weight(.medium))
+            ScrollView {
+                Text(message)
+                    .font(.system(.callout, design: .monospaced))
+                    .foregroundStyle(.secondary)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .textSelection(.enabled)
+            }
+            .frame(maxWidth: 680, maxHeight: 180)
+            .padding(12)
+            .background(Color.secondary.opacity(0.08), in: RoundedRectangle(cornerRadius: 8))
+            Text("Check the SSH host or alias, network/VPN, credentials, and ~/.ssh/config, then retry.")
+                .font(.footnote).foregroundStyle(.secondary)
+                .multilineTextAlignment(.center)
+
+            VStack(alignment: .leading, spacing: 10) {
+                Text("SSH credentials").font(.subheadline.weight(.semibold))
+                SecureField("Destination password for \(service.host.alias) (optional)", text: $password)
+                    .textFieldStyle(.roundedBorder)
+                    .onSubmit { connectWithPassword() }
+                if let jumpHost = service.host.effectiveProxyJump {
+                    SecureField("Jump-host password for \(jumpHost) (optional)", text: $jumpPassword)
+                        .textFieldStyle(.roundedBorder)
+                        .onSubmit { connectWithPassword() }
+                    Text("The jump-host password is used only for SSH prompts from \(jumpHost).")
+                        .font(.caption).foregroundStyle(.secondary)
+                }
+                Toggle("Save entered passwords in macOS Keychain", isOn: $rememberPassword)
+                    .toggleStyle(.checkbox)
+                Text("Passwords are supplied to the system SSH client and are never added to the command or host file.")
+                    .font(.caption).foregroundStyle(.secondary)
+            }
+            .padding(14)
+            .frame(maxWidth: 420)
+            .background(Color.secondary.opacity(0.06))
+            .clipShape(RoundedRectangle(cornerRadius: 12))
+
+            HStack {
+                Button("Retry") { manager.retryConnection(service.id) }
+                    .buttonStyle(.bordered)
+                Button("Connect with Password") { connectWithPassword() }
+                    .buttonStyle(.borderedProminent)
+                    .disabled(password.isEmpty && jumpPassword.isEmpty)
+                Button("Copy Error") {
+                    NSPasteboard.general.clearContents()
+                    NSPasteboard.general.setString(message, forType: .string)
+                }
+            }
+        }
+        .padding(32).frame(maxWidth: .infinity, maxHeight: .infinity)
+    }
+
+    private func connectWithPassword() {
+        guard !password.isEmpty || !jumpPassword.isEmpty else { return }
+        let submittedPassword = password
+        let submittedJumpPassword = jumpPassword
+        password = ""
+        jumpPassword = ""
+        manager.retryConnection(service.id,
+                                password: submittedPassword.isEmpty ? nil : submittedPassword,
+                                jumpPassword: submittedJumpPassword.isEmpty ? nil : submittedJumpPassword,
+                                rememberPassword: rememberPassword)
+    }
+
+    private func statusView(title: String, detail: String?) -> some View {
         VStack(spacing: 14) {
-            if error {
-                Image(systemName: "exclamationmark.triangle.fill")
-                    .font(.largeTitle).foregroundStyle(.red)
-            } else {
-                ProgressView()
-            }
+            ProgressView()
             Text(title).font(.headline)
-            if error {
-                Text("Host: \(service.host.alias)")
-                    .font(.subheadline.weight(.medium))
-            }
             if let detail {
-                if error {
-                    ScrollView {
-                        Text(detail)
-                            .font(.system(.callout, design: .monospaced))
-                            .foregroundStyle(.secondary)
-                            .frame(maxWidth: .infinity, alignment: .leading)
-                            .textSelection(.enabled)
-                    }
-                    .frame(maxWidth: 680, maxHeight: 180)
-                    .padding(12)
-                    .background(Color.secondary.opacity(0.08), in: RoundedRectangle(cornerRadius: 8))
-                    Text("Check the SSH host or alias, network/VPN, credentials, and ~/.ssh/config, then retry.")
-                        .font(.footnote).foregroundStyle(.secondary)
-                        .multilineTextAlignment(.center)
-                } else {
-                    Text(detail).font(.callout).foregroundStyle(.secondary)
-                        .multilineTextAlignment(.center).textSelection(.enabled)
-                }
+                Text(detail).font(.callout).foregroundStyle(.secondary)
+                    .multilineTextAlignment(.center).textSelection(.enabled)
             }
-            if error || service.state == .disconnected {
-                HStack {
-                    Button("Retry") { service.retry() }.buttonStyle(.borderedProminent)
-                    if error, let detail {
-                        Button("Copy Error") {
-                            NSPasteboard.general.clearContents()
-                            NSPasteboard.general.setString(detail, forType: .string)
-                        }
-                    }
-                }
+            if service.state == .disconnected {
+                Button("Retry") { manager.retryConnection(service.id) }.buttonStyle(.borderedProminent)
             }
         }
         .padding(32).frame(maxWidth: .infinity, maxHeight: .infinity)

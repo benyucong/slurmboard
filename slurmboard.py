@@ -25,6 +25,7 @@ import html as _html
 import json
 import logging
 import os
+import platform
 import random
 import re
 import secrets
@@ -49,6 +50,7 @@ _CACHE_LOCK = threading.RLock()
 _CACHE = {}
 _PARTITION_NODELISTS = {}
 _QUOTA_COMMAND = None
+_DASHBOARD_MODE = "auto"
 _NODE_ENRICH_LIMIT = 1000
 _NODE_ENRICH_TTL = 60
 _PARTITION_JOBS_TTL = 20
@@ -106,6 +108,293 @@ def _cached(key, ttl, loader, refresh=False):
         return value
 
 
+# ---------------------------------------------------------------------------
+# Standalone server data collection
+# ---------------------------------------------------------------------------
+
+def dashboard_mode():
+    """Choose the Slurm dashboard when its client CLI exists, else server mode."""
+    if _DASHBOARD_MODE in ("slurm", "server"):
+        return _DASHBOARD_MODE
+    required = ("sinfo", "scontrol", "squeue")
+    return "slurm" if all(shutil.which(command) for command in required) else "server"
+
+
+def _read_text(path):
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as handle:
+            return handle.read()
+    except OSError:
+        return ""
+
+
+def parse_proc_stat(text):
+    """Return total and idle CPU ticks from Linux ``/proc/stat``."""
+    first = next((line for line in text.splitlines() if line.startswith("cpu ")), "")
+    values = []
+    for field in first.split()[1:]:
+        try:
+            values.append(int(field))
+        except ValueError:
+            break
+    if len(values) < 4:
+        return None
+    idle = values[3] + (values[4] if len(values) > 4 else 0)
+    return sum(values), idle
+
+
+def cpu_percent_between(before, after):
+    """Calculate aggregate CPU use from two ``parse_proc_stat`` samples."""
+    if not before or not after:
+        return None
+    total_delta = after[0] - before[0]
+    idle_delta = after[1] - before[1]
+    if total_delta <= 0:
+        return None
+    return round(max(0.0, min(100.0, (total_delta - idle_delta) / total_delta * 100)), 1)
+
+
+def parse_meminfo(text):
+    """Parse Linux ``/proc/meminfo`` into byte totals."""
+    values = {}
+    for line in text.splitlines():
+        if ":" not in line:
+            continue
+        key, raw = line.split(":", 1)
+        fields = raw.split()
+        if not fields:
+            continue
+        try:
+            amount = int(fields[0])
+        except ValueError:
+            continue
+        multiplier = 1024 if len(fields) > 1 and fields[1].lower() == "kb" else 1
+        values[key] = amount * multiplier
+    total = values.get("MemTotal", 0)
+    available = values.get("MemAvailable", values.get("MemFree", 0))
+    swap_total = values.get("SwapTotal", 0)
+    swap_free = values.get("SwapFree", 0)
+    return {
+        "total": total,
+        "used": max(total - available, 0),
+        "available": available,
+        "swap_total": swap_total,
+        "swap_used": max(swap_total - swap_free, 0),
+    }
+
+
+def parse_df_output(text):
+    """Parse portable ``df -Pk`` output and discard pseudo-filesystems."""
+    disks = []
+    seen = set()
+    for line in text.splitlines()[1:]:
+        fields = line.split(None, 5)
+        if len(fields) != 6:
+            continue
+        filesystem, total, used, available, percent, mount = fields
+        if filesystem in ("tmpfs", "devtmpfs"):
+            continue
+        if mount != "/" and mount.startswith(("/proc", "/sys", "/dev", "/run")):
+            continue
+        try:
+            total_bytes = int(total) * 1024
+            used_bytes = int(used) * 1024
+            available_bytes = int(available) * 1024
+            used_percent = float(percent.rstrip("%"))
+        except ValueError:
+            continue
+        key = (filesystem, mount)
+        if total_bytes <= 0 or key in seen:
+            continue
+        seen.add(key)
+        disks.append({
+            "filesystem": filesystem,
+            "mount": mount,
+            "total": total_bytes,
+            "used": used_bytes,
+            "available": available_bytes,
+            "used_percent": used_percent,
+        })
+    disks.sort(key=lambda disk: (disk["mount"] != "/", disk["mount"]))
+    return disks
+
+
+def _optional_float(value):
+    cleaned = str(value).strip()
+    if not cleaned or cleaned.lower() in ("n/a", "[not supported]", "not supported"):
+        return None
+    try:
+        return float(cleaned)
+    except ValueError:
+        return None
+
+
+def parse_nvidia_smi(text):
+    """Parse the stable CSV query produced by ``nvidia-smi``."""
+    gpus = []
+    for line in text.splitlines():
+        fields = [field.strip() for field in line.split(",")]
+        if len(fields) != 9:
+            continue
+        index, name, uuid, temperature, utilization, memory_used, memory_total, power, power_limit = fields
+        try:
+            gpu_index = int(index)
+        except ValueError:
+            continue
+        gpus.append({
+            "index": gpu_index,
+            "name": name,
+            "uuid": uuid,
+            "temperature_c": _optional_float(temperature),
+            "utilization_percent": _optional_float(utilization),
+            "memory_used_mb": _optional_float(memory_used),
+            "memory_total_mb": _optional_float(memory_total),
+            "power_w": _optional_float(power),
+            "power_limit_w": _optional_float(power_limit),
+        })
+    return gpus
+
+
+def parse_gpu_processes(text):
+    processes = []
+    for line in text.splitlines():
+        fields = [field.strip() for field in line.split(",", 3)]
+        if len(fields) != 4:
+            continue
+        uuid, pid, name, memory = fields
+        try:
+            pid_value = int(pid)
+        except ValueError:
+            continue
+        processes.append({
+            "gpu_uuid": uuid,
+            "pid": pid_value,
+            "command": name,
+            "memory_used_mb": _optional_float(memory),
+        })
+    return processes
+
+
+def parse_ps_output(text):
+    """Parse the current user's process table without exposing arguments."""
+    processes = []
+    for line in text.splitlines():
+        fields = line.strip().split(None, 5)
+        if len(fields) != 6:
+            continue
+        pid, user, cpu, memory, elapsed, command = fields
+        try:
+            processes.append({
+                "pid": int(pid), "user": user,
+                "cpu_percent": float(cpu), "memory_percent": float(memory),
+                "elapsed": elapsed, "command": os.path.basename(command) or command,
+            })
+        except ValueError:
+            continue
+    processes.sort(key=lambda process: (-process["cpu_percent"], process["pid"]))
+    return processes[:100]
+
+
+def _server_command(command, timeout=10):
+    completed = subprocess.run(
+        command, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+        text=True, check=True, timeout=timeout,
+    )
+    return completed.stdout
+
+
+def collect_server_snapshot():
+    """Collect read-only Linux host, NVIDIA GPU, disk, and user-process data."""
+    generated_at = time.strftime("%Y-%m-%d %H:%M:%S")
+    errors = []
+    cpuinfo = _read_text("/proc/cpuinfo")
+    cpu_model = next((line.split(":", 1)[1].strip() for line in cpuinfo.splitlines()
+                      if line.lower().startswith(("model name", "hardware")) and ":" in line), "")
+    before = parse_proc_stat(_read_text("/proc/stat"))
+    if before:
+        time.sleep(0.15)
+    after = parse_proc_stat(_read_text("/proc/stat"))
+    try:
+        loads = os.getloadavg()
+    except (AttributeError, OSError):
+        loads = (None, None, None)
+    try:
+        uptime_seconds = float(_read_text("/proc/uptime").split()[0])
+    except (ValueError, IndexError):
+        uptime_seconds = None
+
+    memory = parse_meminfo(_read_text("/proc/meminfo"))
+
+    try:
+        disks = parse_df_output(_server_command(["df", "-Pk"]))
+    except (OSError, subprocess.SubprocessError) as exc:
+        disks = []
+        errors.append(f"disk data unavailable: {exc}")
+
+    gpus = []
+    gpu_processes = []
+    if shutil.which("nvidia-smi"):
+        try:
+            query = (
+                "index,name,uuid,temperature.gpu,utilization.gpu,"
+                "memory.used,memory.total,power.draw,power.limit"
+            )
+            gpus = parse_nvidia_smi(_server_command([
+                "nvidia-smi", f"--query-gpu={query}",
+                "--format=csv,noheader,nounits",
+            ]))
+        except (OSError, subprocess.SubprocessError) as exc:
+            errors.append(f"GPU data unavailable: {exc}")
+        try:
+            gpu_processes = parse_gpu_processes(_server_command([
+                "nvidia-smi", "--query-compute-apps=gpu_uuid,pid,process_name,used_memory",
+                "--format=csv,noheader,nounits",
+            ]))
+        except (OSError, subprocess.SubprocessError):
+            pass
+
+    try:
+        ps_command = [
+            "ps", "-u", str(os.getuid()), "-o",
+            "pid=,user=,pcpu=,pmem=,etime=,comm=", "--sort=-pcpu",
+        ]
+        try:
+            process_text = _server_command(ps_command)
+        except subprocess.CalledProcessError:
+            process_text = _server_command(ps_command[:-1])
+        processes = parse_ps_output(process_text)
+    except (OSError, subprocess.SubprocessError) as exc:
+        processes = []
+        errors.append(f"process data unavailable: {exc}")
+
+    return {
+        "mode": "server",
+        "generated_at": generated_at,
+        "host": {
+            "hostname": socket.gethostname(),
+            "user": getpass.getuser(),
+            "platform": platform.platform(),
+            "uptime_seconds": uptime_seconds,
+            "load": list(loads),
+        },
+        "cpu": {
+            "logical_cores": os.cpu_count() or 0,
+            "model": cpu_model,
+            "used_percent": cpu_percent_between(before, after),
+        },
+        "memory": memory,
+        "disks": disks,
+        "gpus": gpus,
+        "gpu_processes": gpu_processes,
+        "processes": processes,
+        "errors": errors,
+    }
+
+
+def build_server_snapshot(refresh=False):
+    return _cached("server-snapshot", 5, collect_server_snapshot, refresh=refresh)
+
+
 _ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
 _SCALED_AMOUNT_RE = re.compile(
     r"^([0-9]+(?:[.,][0-9]+)?)([KMGTPE]?)(?:I?B)?$", re.IGNORECASE
@@ -116,6 +405,15 @@ _LUMI_QUOTA_ROW_RE = re.compile(
     r"([0-9][0-9.,]*\s*[KMGTPE]?(?:i?B)?)\s+"
     r"([0-9][0-9.,]*\s*[KMGTPE]?)\s*/\s*"
     r"([0-9][0-9.,]*\s*[KMGTPE]?)\s*$",
+    re.IGNORECASE,
+)
+_BSC_QUOTA_ROW_RE = re.compile(
+    r"^\s*(\S+)\s+(USR|GRP)\s+"
+    r"([0-9][0-9.,]*\s*[KMGTPE]?(?:i?B)?)\s+"
+    r"([0-9][0-9.,]*\s*[KMGTPE]?(?:i?B)?)\s+"
+    r"([0-9][0-9.,]*\s*[KMGTPE]?(?:i?B)?)\s+"
+    r"[0-9][0-9.,]*\s*[KMGTPE]?(?:i?B)?\s+\S+\s*\|\s*"
+    r"([0-9]+)\s+[0-9]+\s*$",
     re.IGNORECASE,
 )
 
@@ -300,6 +598,30 @@ def parse_gpfs_quota(text):
     return rows
 
 
+def parse_bsc_quota(text):
+    """Parse Barcelona Supercomputing Center's ``bsc_quota`` table."""
+    rows = []
+    group_name = None
+    clean = _ANSI_ESCAPE_RE.sub("", text)
+    group_match = re.search(
+        r"Printing quota for group\s+([^:\s]+)", clean, re.IGNORECASE,
+    )
+    if group_match:
+        group_name = group_match.group(1)
+    for raw_line in clean.splitlines():
+        match = _BSC_QUOTA_ROW_RE.match(raw_line)
+        if not match:
+            continue
+        filesystem, quota_type, used, quota, _hard_limit, files = match.groups()
+        scope = "User" if quota_type.upper() == "USR" else "Group"
+        if scope == "Group" and group_name:
+            scope = f"Group: {group_name}"
+        rows.append(_quota_row(
+            scope, filesystem, used, quota, files, "-",
+        ))
+    return rows
+
+
 def parse_beegfs_quota(text):
     """Parse BeeGFS quota tables from storage pools (BeeGFS 7 and 8)."""
     rows = []
@@ -326,7 +648,7 @@ def parse_beegfs_quota(text):
 
 def parse_quota_output(text):
     """Try all known structured formats; callers retain raw output as fallback."""
-    for parser in (parse_lumi_quota, parse_beegfs_quota,
+    for parser in (parse_lumi_quota, parse_bsc_quota, parse_beegfs_quota,
                    parse_gpfs_quota, parse_posix_quota):
         rows = parser(text)
         if rows:
@@ -357,6 +679,7 @@ def _quota_candidates():
         ("myquota", ["myquota"]),
         ("showquota", ["showquota"]),
         ("checkquota", ["checkquota"]),
+        ("bsc-quota", ["bsc_quota"]),
         ("quota", ["quota", "-s"]),
         ("quota", ["quota"]),
         ("mmlsquota", ["mmlsquota", "--block-size", "auto"]),
@@ -3170,7 +3493,179 @@ if (SNAPSHOT.auto_load_personal) {
 """
 
 
+SERVER_PAGE_TEMPLATE = """<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Server Dashboard</title>
+<style>
+  :root { color-scheme: dark; --bg:#0d1015; --panel:#171b23; --panel2:#1d222c;
+    --border:#2c3340; --text:#e7eaf0; --muted:#919aaa; --accent:#4f8cff;
+    --good:#45c985; --warn:#efb84b; --bad:#ef6464; }
+  :root.light { color-scheme: light; --bg:#f4f6f9; --panel:#fff; --panel2:#f0f3f7;
+    --border:#d8dde6; --text:#1d2430; --muted:#647084; --accent:#236be6;
+    --good:#15975a; --warn:#bc7800; --bad:#d63c3c; }
+  * { box-sizing:border-box; }
+  body { margin:0; background:var(--bg); color:var(--text); font:14px -apple-system,
+    BlinkMacSystemFont,"Segoe UI",sans-serif; min-width:900px; }
+  header { height:58px; display:flex; align-items:center; gap:14px; padding:0 20px;
+    border-bottom:1px solid var(--border); background:color-mix(in srgb,var(--bg) 92%,transparent);
+    position:sticky; top:0; z-index:2; backdrop-filter:blur(14px); }
+  header h1 { margin:0; font-size:19px; letter-spacing:-.2px; }
+  .hostline { color:var(--muted); font-size:12px; min-width:0; overflow:hidden;
+    text-overflow:ellipsis; white-space:nowrap; }
+  .spacer { flex:1; }
+  button,select { border:1px solid var(--border); border-radius:7px; background:var(--panel);
+    color:var(--text); padding:7px 10px; font:inherit; }
+  button { cursor:pointer; } button.primary { background:var(--accent); color:white; border-color:transparent; }
+  button:disabled { opacity:.6; cursor:default; }
+  main { padding:18px; display:grid; gap:18px; }
+  .overview { display:grid; grid-template-columns:repeat(4,minmax(180px,1fr)); gap:14px; }
+  .card,.section { border:1px solid var(--border); background:var(--panel); border-radius:12px; }
+  .card { padding:15px; min-height:130px; }
+  .label { color:var(--muted); font-size:11px; text-transform:uppercase; letter-spacing:.08em; }
+  .value { font-size:25px; font-weight:700; margin:8px 0 5px; letter-spacing:-.4px; }
+  .sub { color:var(--muted); font-size:12px; line-height:1.45; }
+  .bar { height:7px; border-radius:99px; background:var(--panel2); overflow:hidden; margin-top:12px; }
+  .bar > span { display:block; height:100%; border-radius:inherit; background:var(--good); }
+  .bar > span.warn { background:var(--warn); } .bar > span.bad { background:var(--bad); }
+  .section { overflow:hidden; }
+  .section-head { display:flex; align-items:center; gap:10px; padding:14px 16px;
+    border-bottom:1px solid var(--border); }
+  .section-head h2 { font-size:14px; margin:0; text-transform:uppercase; letter-spacing:.055em; }
+  .count { color:var(--muted); font-size:12px; }
+  .section-body { padding:14px 16px; }
+  .gpu-grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(280px,1fr)); gap:12px; }
+  .gpu { background:var(--panel2); border-radius:9px; padding:13px; }
+  .gpu-title { display:flex; gap:9px; align-items:baseline; font-weight:650; }
+  .gpu-title span { color:var(--muted); font-size:12px; font-weight:400; }
+  .gpu-stats { display:grid; grid-template-columns:repeat(3,1fr); gap:8px; margin-top:12px; }
+  .gpu-stat b { display:block; font-size:16px; margin-bottom:2px; }
+  .gpu-stat small { color:var(--muted); }
+  .two-col { display:grid; grid-template-columns:minmax(420px,.9fr) minmax(560px,1.25fr);
+    gap:18px; align-items:start; }
+  #disks,#processes { max-height:560px; overflow:auto; }
+  #disks thead,#processes thead { position:sticky; top:0; background:var(--panel); z-index:1; }
+  table { width:100%; border-collapse:collapse; font-size:12px; }
+  th { text-align:left; color:var(--muted); font-weight:600; text-transform:uppercase;
+    letter-spacing:.04em; padding:8px; border-bottom:1px solid var(--border); }
+  td { padding:8px; border-bottom:1px solid var(--border); vertical-align:middle; }
+  tbody tr:last-child td { border-bottom:0; }
+  .num { text-align:right; font-variant-numeric:tabular-nums; }
+  .mono { font-family:ui-monospace,SFMono-Regular,Menlo,monospace; }
+  .empty { color:var(--muted); padding:18px 4px; text-align:center; }
+  .errors { display:none; border:1px solid color-mix(in srgb,var(--bad) 55%,var(--border));
+    background:color-mix(in srgb,var(--bad) 10%,var(--panel)); color:var(--bad);
+    border-radius:10px; padding:10px 14px; }
+  @media(max-width:1150px){ .overview{grid-template-columns:repeat(2,1fr)} .two-col{grid-template-columns:1fr} }
+</style>
+</head>
+<body>
+<header>
+  <h1>▣ Server Dashboard</h1>
+  <div class="hostline" id="hostline"></div>
+  <div class="spacer"></div>
+  <button id="theme" title="Toggle light/dark theme">☀︎</button>
+  <label class="hostline">Auto refresh
+    <select id="interval"><option value="0">Manual</option><option value="5">5 seconds</option>
+      <option value="10">10 seconds</option><option value="15">15 seconds</option>
+      <option value="30">30 seconds</option><option value="60">1 minute</option></select>
+  </label>
+  <button class="primary" id="refresh">↻ Refresh now</button>
+</header>
+<main>
+  <div class="errors" id="errors"></div>
+  <section class="overview">
+    <div class="card"><div class="label">CPU</div><div class="value" id="cpu-value">—</div>
+      <div class="sub" id="cpu-sub"></div><div class="bar"><span id="cpu-bar"></span></div></div>
+    <div class="card"><div class="label">Memory</div><div class="value" id="memory-value">—</div>
+      <div class="sub" id="memory-sub"></div><div class="bar"><span id="memory-bar"></span></div></div>
+    <div class="card"><div class="label">Load average</div><div class="value" id="load-value">—</div>
+      <div class="sub" id="load-sub"></div></div>
+    <div class="card"><div class="label">Host</div><div class="value" id="host-value">—</div>
+      <div class="sub" id="host-sub"></div></div>
+  </section>
+  <section class="section">
+    <div class="section-head"><h2>NVIDIA GPUs</h2><span class="count" id="gpu-count"></span></div>
+    <div class="section-body"><div class="gpu-grid" id="gpus"></div><div id="gpu-processes"></div></div>
+  </section>
+  <div class="two-col">
+    <section class="section"><div class="section-head"><h2>Storage</h2><span class="count" id="disk-count"></span></div>
+      <div class="section-body" id="disks"></div></section>
+    <section class="section"><div class="section-head"><h2>My processes</h2><span class="count" id="process-count"></span></div>
+      <div class="section-body" id="processes"></div></section>
+  </div>
+</main>
+<script>
+let DATA=__SERVER_SNAPSHOT_JSON__, timer=null;
+const $=id=>document.getElementById(id);
+const esc=value=>String(value??'—').replace(/[&<>"']/g,ch=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[ch]));
+const clamp=value=>Math.max(0,Math.min(100,Number(value)||0));
+function bytes(value){ if(value==null)return '—'; let n=Number(value),u=['B','KB','MB','GB','TB','PB'],i=0;
+  while(n>=1024&&i<u.length-1){n/=1024;i++} return `${n.toFixed(i<2?0:n<10?2:1)} ${u[i]}`; }
+function duration(seconds){ if(seconds==null)return 'uptime unavailable'; let s=Math.floor(seconds),d=Math.floor(s/86400);
+  s%=86400; const h=Math.floor(s/3600),m=Math.floor((s%3600)/60); return `up ${d?d+'d ':''}${h}h ${m}m`; }
+function pct(used,total){ return total?used/total*100:0; }
+function barClass(value){ return value>=90?'bad':value>=75?'warn':''; }
+function setBar(id,value){ const el=$(id),p=clamp(value); el.style.width=`${p}%`; el.className=barClass(p); }
+function renderOverview(){ const cpu=DATA.cpu||{},mem=DATA.memory||{},host=DATA.host||{};
+  $('cpu-value').textContent=cpu.used_percent==null?'—':`${cpu.used_percent.toFixed(1)}%`;
+  $('cpu-sub').textContent=`${cpu.logical_cores||'—'} logical cores${cpu.model?' · '+cpu.model:''}`; setBar('cpu-bar',cpu.used_percent);
+  const mp=pct(mem.used,mem.total); $('memory-value').textContent=mem.total?`${mp.toFixed(1)}%`:'—';
+  $('memory-sub').textContent=mem.total?`${bytes(mem.used)} used of ${bytes(mem.total)}${mem.swap_total?' · swap '+bytes(mem.swap_used)+' / '+bytes(mem.swap_total):''}`:'Memory data unavailable'; setBar('memory-bar',mp);
+  const load=host.load||[]; $('load-value').textContent=load[0]==null?'—':load.map(v=>Number(v).toFixed(2)).join(' · ');
+  $('load-sub').textContent='1 · 5 · 15 minute load averages'; $('host-value').textContent=host.hostname||'—';
+  $('host-sub').textContent=`${host.user||''} · ${duration(host.uptime_seconds)} · ${host.platform||''}`;
+  $('hostline').textContent=`${host.user||''}@${host.hostname||''} · snapshot ${DATA.generated_at||'—'}`; }
+function renderGpus(){ const gpus=DATA.gpus||[],procs=DATA.gpu_processes||[]; $('gpu-count').textContent=`${gpus.length} detected`;
+  if(!gpus.length){$('gpus').innerHTML='<div class="empty">No NVIDIA GPU detected or nvidia-smi is unavailable.</div>'; $('gpu-processes').innerHTML='';return;}
+  $('gpus').innerHTML=gpus.map(g=>{const util=g.utilization_percent??0,mp=pct(g.memory_used_mb,g.memory_total_mb);
+    return `<article class="gpu"><div class="gpu-title">GPU ${g.index} <span>${esc(g.name)}</span></div>
+      <div class="gpu-stats"><div class="gpu-stat"><b>${g.utilization_percent==null?'—':g.utilization_percent.toFixed(0)+'%'}</b><small>utilization</small></div>
+      <div class="gpu-stat"><b>${g.temperature_c==null?'—':g.temperature_c.toFixed(0)+'°C'}</b><small>temperature</small></div>
+      <div class="gpu-stat"><b>${g.power_w==null?'—':g.power_w.toFixed(0)+' W'}</b><small>${g.power_limit_w==null?'power':'of '+g.power_limit_w.toFixed(0)+' W'}</small></div></div>
+      <div class="sub" style="margin-top:12px">VRAM ${g.memory_used_mb==null?'—':g.memory_used_mb.toFixed(0)+' MB'} / ${g.memory_total_mb==null?'—':g.memory_total_mb.toFixed(0)+' MB'}</div>
+      <div class="bar"><span class="${barClass(mp)}" style="width:${clamp(mp)}%"></span></div></article>`}).join('');
+  $('gpu-processes').innerHTML=!procs.length?'':`<table style="margin-top:14px"><thead><tr><th>GPU process</th><th>PID</th><th class="num">VRAM</th></tr></thead><tbody>${procs.map(p=>`<tr><td class="mono">${esc(p.command)}</td><td>${p.pid}</td><td class="num">${p.memory_used_mb==null?'—':p.memory_used_mb.toFixed(0)+' MB'}</td></tr>`).join('')}</tbody></table>`; }
+function renderDisks(){ const rows=DATA.disks||[]; $('disk-count').textContent=`${rows.length} filesystems`;
+  $('disks').innerHTML=!rows.length?'<div class="empty">Disk data unavailable.</div>':`<table><thead><tr><th>Mount</th><th>Filesystem</th><th class="num">Used</th></tr></thead><tbody>${rows.map(d=>`<tr><td class="mono">${esc(d.mount)}</td><td title="${esc(d.filesystem)}">${esc(d.filesystem)}</td><td class="num">${bytes(d.used)} / ${bytes(d.total)}<div class="bar"><span class="${barClass(d.used_percent)}" style="width:${clamp(d.used_percent)}%"></span></div></td></tr>`).join('')}</tbody></table>`; }
+function renderProcesses(){ const rows=DATA.processes||[]; $('process-count').textContent=`top ${rows.length}`;
+  $('processes').innerHTML=!rows.length?'<div class="empty">No process data available.</div>':`<table><thead><tr><th>PID</th><th>Command</th><th>Elapsed</th><th class="num">CPU</th><th class="num">Memory</th></tr></thead><tbody>${rows.map(p=>`<tr><td>${p.pid}</td><td class="mono">${esc(p.command)}</td><td>${esc(p.elapsed)}</td><td class="num">${p.cpu_percent.toFixed(1)}%</td><td class="num">${p.memory_percent.toFixed(1)}%</td></tr>`).join('')}</tbody></table>`; }
+function render(){ renderOverview();renderGpus();renderDisks();renderProcesses(); const errors=DATA.errors||[];
+  $('errors').style.display=errors.length?'block':'none'; $('errors').textContent=errors.join(' · '); }
+async function refresh(){ const button=$('refresh');button.disabled=true;button.textContent='Refreshing…';
+  try{const response=await fetch('/data/server?refresh=1');if(!response.ok)throw new Error(`HTTP ${response.status}`);DATA=await response.json();render();}
+  catch(error){$('errors').style.display='block';$('errors').textContent=`Refresh failed: ${error.message}`;}
+  finally{button.disabled=false;button.textContent='↻ Refresh now';} }
+function setIntervalSeconds(seconds){if(timer)clearInterval(timer);timer=seconds?setInterval(()=>{if(!document.hidden)refresh()},seconds*1000):null;localStorage.setItem('server_refresh_seconds',String(seconds));}
+$('refresh').addEventListener('click',refresh);$('interval').addEventListener('change',event=>setIntervalSeconds(Number(event.target.value)));
+$('theme').addEventListener('click',()=>document.documentElement.classList.toggle('light'));
+const saved=Number(localStorage.getItem('server_refresh_seconds'));$('interval').value=String([0,5,10,15,30,60].includes(saved)?saved:10);setIntervalSeconds(Number($('interval').value));render();
+</script>
+</body>
+</html>
+"""
+
+
+def render_server_page():
+    try:
+        snapshot = build_server_snapshot()
+    except Exception as exc:
+        snapshot = {
+            "mode": "server", "generated_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "host": {"hostname": socket.gethostname(), "user": getpass.getuser(),
+                     "platform": platform.platform(), "uptime_seconds": None, "load": []},
+            "cpu": {}, "memory": {}, "disks": [], "gpus": [],
+            "gpu_processes": [], "processes": [], "errors": [str(exc)],
+        }
+    payload = json.dumps(snapshot).replace("</", "<\\/")
+    return SERVER_PAGE_TEMPLATE.replace("__SERVER_SNAPSHOT_JSON__", payload).encode("utf-8")
+
+
 def render_page():
+    if dashboard_mode() == "server":
+        return render_server_page()
     try:
         snapshot = build_snapshot()
         snapshot_json = json.dumps(snapshot)
@@ -3225,6 +3720,12 @@ class Handler(BaseHTTPRequestHandler):
             self.send_header("Cache-Control",  "no-store")
             self.end_headers()
             self.wfile.write(body)
+        elif path == "/data/server":
+            try:
+                self._send_json(200, build_server_snapshot(refresh=refresh))
+            except Exception as exc:
+                log.error("server snapshot query failed: %s", exc, exc_info=True)
+                self._send_json(500, {"error": str(exc)})
         elif path.startswith("/api/job/"):
             jobid = path[len("/api/job/"):].strip("/")
             try:
@@ -4082,7 +4583,7 @@ def print_forwarding_instructions(port):
 
 
 def main():
-    global _QUOTA_COMMAND
+    global _QUOTA_COMMAND, _DASHBOARD_MODE
     ap = argparse.ArgumentParser(
         description="Tiny Slurm cluster dashboard, with an optional local SSH launcher.")
     ap.add_argument("--host",      default="0.0.0.0",  help="bind address (default: 0.0.0.0)")
@@ -4100,6 +4601,8 @@ def main():
                     help="OpenSSH config used by the launcher (default: ~/.ssh/config)")
     ap.add_argument("--quota-command", default=None,
                     help="custom read-only quota command for site-specific HPC storage")
+    ap.add_argument("--mode", choices=("auto", "slurm", "server"), default="auto",
+                    help="dashboard mode (default: auto; use server for a non-Slurm host)")
     ap.add_argument("--no-browser", action="store_true",
                     help="do not automatically open the launcher page")
     ap.add_argument("--log-level", default="info",
@@ -4107,6 +4610,7 @@ def main():
                     help="log verbosity (default: info)")
     args = ap.parse_args()
     _QUOTA_COMMAND = args.quota_command
+    _DASHBOARD_MODE = args.mode
 
     logging.basicConfig(
         level=getattr(logging, args.log_level.upper()),

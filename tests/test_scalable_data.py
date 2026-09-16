@@ -376,6 +376,47 @@ alice     | 1000  || 1024.00 MiB|1024.00 MiB|| 1     |unlimited
         self.assertEqual(rows[0]["space_percent"], 100.0)
         self.assertEqual(rows[0]["files_limit_label"], "unlimited")
 
+    def test_parses_bsc_gpfs_quota_with_ansi_colors(self):
+        output = """
+\x1b[1m\x1b[38;5;117m Printing quota for group ehpc389:\x1b[22m\x1b[0m
+\x1b[1;30m\x1b[47m    Filesystem   Type          Usage          Quota          Limit     In doubt     Grace  |       Files  In doubt  \x1b[0m
+\x1b[48;5;235m     gpfs_home    USR       11.25 GB       80.00 GB       84.00 GB      0.00 KB      None  |       83447         0  \x1b[0m
+\x1b[48;5;235m gpfs_projects    GRP      484.77 GB     1000.00 GB        1.03 TB      0.00 KB      None  |      937239         0  \x1b[0m
+\x1b[48;5;235m  gpfs_scratch    GRP        0.00 KB        2.00 TB        2.10 TB      0.00 KB      None  |           1         0  \x1b[0m
+"""
+
+        rows = SLURMBOARD.parse_bsc_quota(output)
+
+        self.assertEqual(len(rows), 3)
+        self.assertEqual(rows[0]["scope"], "User")
+        self.assertEqual(rows[0]["path"], "gpfs_home")
+        self.assertEqual(rows[0]["space_used_label"], "11.25 GB")
+        self.assertEqual(rows[0]["space_limit_label"], "80.00 GB")
+        self.assertEqual(rows[0]["files_used"], 83447)
+        self.assertIsNone(rows[0]["files_limit"])
+        self.assertEqual(rows[1]["scope"], "Group: ehpc389")
+        self.assertEqual(rows[1]["files_used"], 937239)
+        self.assertEqual(rows[2]["space_limit_label"], "2.00 TB")
+
+    def test_quota_collection_prefers_bsc_helper_over_broken_posix_quota(self):
+        sample = "gpfs_home USR 11.25 GB 80.00 GB 84.00 GB 0.00 KB None | 83447 0\n"
+        availability = lambda command: (
+            f"/apps/modules/bsc/bin/{command}"
+            if command in ("bsc_quota", "quota") else None
+        )
+        with mock.patch.object(
+            SLURMBOARD, "_QUOTA_COMMAND", None
+        ), mock.patch.object(
+            SLURMBOARD.shutil, "which", side_effect=availability
+        ), mock.patch.object(
+            SLURMBOARD, "_run_quota", return_value=sample
+        ) as run:
+            result = SLURMBOARD.collect_storage_quota()
+
+        run.assert_called_once_with(["bsc_quota"])
+        self.assertEqual(result["source"], "bsc-quota")
+        self.assertEqual(result["rows"][0]["path"], "gpfs_home")
+
     def test_quota_collection_uses_lumi_helper_when_available(self):
         sample = "/users/cong 1G/22G 10K/100K\n"
         availability = lambda command: (

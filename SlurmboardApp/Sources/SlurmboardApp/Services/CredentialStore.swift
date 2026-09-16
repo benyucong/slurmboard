@@ -2,9 +2,18 @@ import Foundation
 import Security
 
 enum CredentialStore {
-    private static let service = "fi.aalto.slurmboard.ssh-password"
+    private static let destinationService = "fi.aalto.slurmboard.ssh-password"
+    private static let jumpService = "fi.aalto.slurmboard.ssh-jump-password"
 
     static func password(for hostID: String) -> String? {
+        password(for: hostID, service: destinationService)
+    }
+
+    static func jumpPassword(for hostID: String) -> String? {
+        password(for: hostID, service: jumpService)
+    }
+
+    private static func password(for hostID: String, service: String) -> String? {
         let query: [String: Any] = [
             kSecClass as String: kSecClassGenericPassword,
             kSecAttrService as String: service,
@@ -19,6 +28,14 @@ enum CredentialStore {
     }
 
     static func setPassword(_ password: String, for hostID: String) {
+        setPassword(password, for: hostID, service: destinationService)
+    }
+
+    static func setJumpPassword(_ password: String, for hostID: String) {
+        setPassword(password, for: hostID, service: jumpService)
+    }
+
+    private static func setPassword(_ password: String, for hostID: String, service: String) {
         let data = Data(password.utf8)
         let key: [String: Any] = [
             kSecClass as String: kSecClassGenericPassword,
@@ -35,6 +52,14 @@ enum CredentialStore {
     }
 
     static func deletePassword(for hostID: String) {
+        deletePassword(for: hostID, service: destinationService)
+    }
+
+    static func deleteJumpPassword(for hostID: String) {
+        deletePassword(for: hostID, service: jumpService)
+    }
+
+    private static func deletePassword(for hostID: String, service: String) {
         let query: [String: Any] = [
             kSecClass as String: kSecClassGenericPassword,
             kSecAttrService as String: service,

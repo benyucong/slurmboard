@@ -62,18 +62,23 @@ final class ConnectionManager: ObservableObject {
         saveHosts()
     }
 
-    func addHost(_ host: SSHHost, password: String?) {
+    func addHost(_ host: SSHHost, password: String?, jumpPassword: String? = nil) {
         addHost(host)
         if let password, !password.isEmpty {
             CredentialStore.setPassword(password, for: host.id)
         }
+        if let jumpPassword, !jumpPassword.isEmpty {
+            CredentialStore.setJumpPassword(jumpPassword, for: host.id)
+        }
     }
 
     func updateHost(_ host: SSHHost, replacing originalID: String,
-                    password: String?, clearPassword: Bool) {
+                    password: String?, clearPassword: Bool,
+                    jumpPassword: String?, clearJumpPassword: Bool) {
         let previousPassword = CredentialStore.password(for: originalID)
+        let previousJumpPassword = CredentialStore.jumpPassword(for: originalID)
         guard let index = hosts.firstIndex(where: { $0.id == originalID }) else {
-            addHost(host, password: password)
+            addHost(host, password: password, jumpPassword: jumpPassword)
             return
         }
         if let duplicate = hosts.firstIndex(where: { $0.id == host.id && $0.id != originalID }) {
@@ -84,13 +89,23 @@ final class ConnectionManager: ObservableObject {
         } else if index <= hosts.endIndex {
             hosts.insert(host, at: min(index, hosts.endIndex))
         }
-        if originalID != host.id { CredentialStore.deletePassword(for: originalID) }
+        if originalID != host.id {
+            CredentialStore.deletePassword(for: originalID)
+            CredentialStore.deleteJumpPassword(for: originalID)
+        }
         if clearPassword {
             CredentialStore.deletePassword(for: host.id)
         } else if let password, !password.isEmpty {
             CredentialStore.setPassword(password, for: host.id)
         } else if let previousPassword, originalID != host.id {
             CredentialStore.setPassword(previousPassword, for: host.id)
+        }
+        if clearJumpPassword {
+            CredentialStore.deleteJumpPassword(for: host.id)
+        } else if let jumpPassword, !jumpPassword.isEmpty {
+            CredentialStore.setJumpPassword(jumpPassword, for: host.id)
+        } else if let previousJumpPassword, originalID != host.id {
+            CredentialStore.setJumpPassword(previousJumpPassword, for: host.id)
         }
         saveHosts()
     }
@@ -105,6 +120,7 @@ final class ConnectionManager: ObservableObject {
     func removeHosts(at offsets: IndexSet) {
         for index in offsets.sorted(by: >) where hosts.indices.contains(index) {
             CredentialStore.deletePassword(for: hosts[index].id)
+            CredentialStore.deleteJumpPassword(for: hosts[index].id)
             hosts.remove(at: index)
         }
         saveHosts()
@@ -117,7 +133,9 @@ final class ConnectionManager: ObservableObject {
             selectedTab = .cluster(existing)
             return existing
         }
-        let svc = DashboardService(host: host, password: CredentialStore.password(for: host.id))
+        let svc = DashboardService(host: host,
+                                   password: CredentialStore.password(for: host.id),
+                                   jumpPassword: CredentialStore.jumpPassword(for: host.id))
         services[svc.id] = svc
         connectionIDs.append(svc.id)
         selectedTab = .cluster(svc.id)
@@ -126,6 +144,26 @@ final class ConnectionManager: ObservableObject {
     }
 
     func service(for id: UUID) -> DashboardService? { services[id] }
+
+    func retryConnection(_ id: UUID, password: String? = nil, jumpPassword: String? = nil,
+                         rememberPassword: Bool = false) {
+        guard let service = services[id] else { return }
+        if rememberPassword {
+            if let password, !password.isEmpty {
+                CredentialStore.setPassword(password, for: service.host.id)
+            }
+            if let jumpPassword, !jumpPassword.isEmpty {
+                CredentialStore.setJumpPassword(jumpPassword, for: service.host.id)
+            }
+        }
+        if let password, !password.isEmpty {
+            service.retry(password: password, jumpPassword: jumpPassword)
+        } else if let jumpPassword, !jumpPassword.isEmpty {
+            service.retry(jumpPassword: jumpPassword)
+        } else {
+            service.retry()
+        }
+    }
 
     func openTerminal(host: SSHHost) {
         if let id = terminalIDs.first(where: { terminals[$0]?.host.id == host.id }) {

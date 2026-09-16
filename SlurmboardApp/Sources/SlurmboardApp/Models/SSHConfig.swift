@@ -51,6 +51,59 @@ struct SSHHost: Identifiable, Hashable, Codable {
         return words.isEmpty ? [alias] : words
     }
 
+    /// The first ProxyJump hop, whether it came from parsed config metadata or
+    /// an app-entered SSH command (`-J host` / `-o ProxyJump=host`).
+    var effectiveProxyJump: String? {
+        if let proxyJump, !proxyJump.trimmingCharacters(in: .whitespaces).isEmpty {
+            return Self.firstJump(in: proxyJump)
+        }
+        let arguments = connectionArguments
+        for index in arguments.indices {
+            let argument = arguments[index]
+            if argument == "-J", arguments.indices.contains(index + 1) {
+                return Self.firstJump(in: arguments[index + 1])
+            }
+            if argument.hasPrefix("-J"), argument.count > 2 {
+                return Self.firstJump(in: String(argument.dropFirst(2)))
+            }
+            if argument == "-o", arguments.indices.contains(index + 1),
+               let value = Self.proxyJumpValue(arguments[index + 1]) {
+                return Self.firstJump(in: value)
+            }
+            if argument.lowercased().hasPrefix("-oproxyjump="),
+               let value = argument.split(separator: "=", maxSplits: 1).last {
+                return Self.firstJump(in: String(value))
+            }
+        }
+        return nil
+    }
+
+    /// A hostname-sized hint used to match OpenSSH's askpass prompt.
+    var proxyJumpPromptHint: String? {
+        guard var jump = effectiveProxyJump else { return nil }
+        if let at = jump.lastIndex(of: "@") { jump = String(jump[jump.index(after: at)...]) }
+        if jump.hasPrefix("[") {
+            if let close = jump.firstIndex(of: "]") {
+                jump = String(jump[jump.index(after: jump.startIndex)..<close])
+            }
+        } else if let colon = jump.lastIndex(of: ":") {
+            jump = String(jump[..<colon])
+        }
+        return jump.isEmpty ? nil : jump.lowercased()
+    }
+
+    private static func firstJump(in value: String) -> String? {
+        guard let raw = value.split(separator: ",", maxSplits: 1).first else { return nil }
+        let first = String(raw).trimmingCharacters(in: .whitespacesAndNewlines)
+        return first.isEmpty ? nil : first
+    }
+
+    private static func proxyJumpValue(_ argument: String) -> String? {
+        let pieces = argument.split(separator: "=", maxSplits: 1).map(String.init)
+        guard pieces.count == 2, pieces[0].lowercased() == "proxyjump" else { return nil }
+        return pieces[1]
+    }
+
     private static func shellWords(_ value: String) -> [String] {
         var result: [String] = [], current = ""
         var quote: Character?, escaped = false
